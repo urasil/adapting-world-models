@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# Extensions copyright (c) University of Cambridge.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-
 from functools import partial
 
 import torch
@@ -14,9 +8,7 @@ from src.utils.modules import rotate_queries_or_keys
 from src.utils.tensors import trunc_normal_
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _separate_positions(pos_ids: torch.Tensor, H: int, W: int):
     """Decompose flat patch-space IDs into (temporal, height, width) coordinates."""
@@ -28,52 +20,40 @@ def _separate_positions(pos_ids: torch.Tensor, H: int, W: int):
     return frame_ids.float(), height_ids.float(), width_ids.float()
 
 
-# ---------------------------------------------------------------------------
 # Main class
-# ---------------------------------------------------------------------------
 
 class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
     """Single-pass masked-prediction head for next-segment world-model pre-training.
 
-    Architecture
-    ============
-    Context segments 0..S-1 and a query segment S are assembled into a tensor
-    of shape [B, n_segs, tokens_per_seg, D].  Each segment contributes
-    COND_TOKENS=2 conditioning tokens (verb + noun embedding) followed by
-    T_seg * H * W patch tokens.  For context segments the patch tokens are
-    projected encoder features; for the query segment they are mask tokens.
+    Context segments 0..S-1 and a query segment S are packed into one tensor
+    of shape [B, n_segs, tokens_per_seg, D]. Each segment is COND_TOKENS=2
+    conditioning tokens (verb + noun embedding) followed by T_seg*H*W patch
+    tokens — projected encoder features for context segments, mask tokens for
+    the query segment.
 
-    Attention is segment-block-causal: tokens in segment i attend to all
-    tokens in segments 0..i and nothing later.  This is implemented as n_segs
-    separate SDPA calls per transformer layer, each with a growing key-value
-    context window.  SDPA dispatches to FlashAttention v2 (O(N_q) memory).
+    Attention is segment-causal: segment i attends to all tokens in segments
+    0..i and nothing after. We run this as one SDPA call per segment per
+    layer with a growing key/value window, so FlashAttention v2 handles it in
+    O(N_q) memory instead of materialising an N×N mask.
 
-    Positional encoding
-    ===================
-    3D RoPE (time × height × width) with a global monotonic temporal axis:
-    segment s, frame f → temporal index s * T_seg + f.
-    Conditioning tokens for segment s receive temporal index s * T_seg and
-    spatial index (0, 0), making their spatial RoPE component the identity —
-    matching the ACRoPEAttention convention for action tokens.
+    Positional encoding is 3D RoPE (time, height, width) on a single global
+    temporal axis: segment s, frame f -> temporal index s*T_seg + f.
+    Conditioning tokens use temporal index s*T_seg and spatial index (0, 0),
+    so their spatial RoPE component is the identity — matching how
+    ACRoPEAttention treats action tokens.
 
-    Key differences from VisionTransformerPredictorAC
-    ==================================================
-    * action_encoder / state_encoder / extrinsics_encoder removed.
-    * verb_embedding + noun_embedding replace them (two tokens per segment).
-    * Learnable mask_token for the query block.
-    * Segment-by-segment SDPA (FlashAttention v2) instead of a dense or
-      FlexAttention mask.  No N×N materialisation at any S.
-    * forward() is fully overridden; parent forward() is never called.
+    Differences from VisionTransformerPredictorAC:
+    - action_encoder / state_encoder / extrinsics_encoder are gone;
+      verb_embedding + noun_embedding take their place.
+    - Adds a learnable mask_token for the query segment.
+    - forward() is fully overridden and never calls the parent's forward().
 
-    checkpoint_min_segs:
-        Activation checkpointing trades ~30-40% extra compute (recomputing
-        each block's forward during backward) for lower peak memory.  Shorter
-        examples (small n_segs = ctx_len + 1) need much less memory and may
-        not need checkpointing at all.  If set, checkpointing is only applied
-        when n_segs >= checkpoint_min_segs for that example; shorter examples
-        skip it and pay no recompute overhead.  None (default) checkpoints
-        every example whenever use_activation_checkpointing=True, matching
-        the previous behaviour.
+    checkpoint_min_segs: activation checkpointing saves memory but costs
+    ~30-40% more compute (recomputing each block on the backward pass). Short
+    examples don't need it. If set, only examples with
+    n_segs >= checkpoint_min_segs get checkpointed; shorter ones skip it.
+    Leave as None to checkpoint everything whenever
+    use_activation_checkpointing=True.
     """
 
     COND_TOKENS = 2  # verb token + noun token per segment
@@ -156,24 +136,20 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         self.checkpoint_min_segs = checkpoint_min_segs
         self._T_seg = num_frames // tubelet_size   # 32
 
-        # RoPE per-axis head-dim split — must match ACRoPEAttention exactly.
+        # RoPE per-axis head-dim split, must match ACRoPEAttention exactly.
         head_dim = predictor_embed_dim // num_heads
         self._d_dim = int(2 * ((head_dim // 3) // 2))
         self._h_dim = int(2 * ((head_dim // 3) // 2))
         self._w_dim = int(2 * ((head_dim // 3) // 2))
 
-    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
 
     def _build_pos_ids(self, n_segs: int, device: torch.device) -> torch.Tensor:
-        """Build global position IDs for all tokens in an n_segs-segment sequence.
+        """Global position IDs for every token in an n_segs-segment sequence.
 
-        Layout per segment s (0-indexed):
-            [verb_cond, noun_cond, frame_0_patch_0, ..., frame_{T-1}_patch_{P-1}]
-
-        Conditioning tokens for segment s get pos_id = s * T * H * W, which
-        decodes to temporal = s*T, h = 0, w = 0 (spatial RoPE is identity).
+        Each segment s is laid out as [verb, noun, patch_0, ..., patch_{P-1}].
+        The conditioning tokens get pos_id = s*T*H*W, which decodes to
+        temporal = s*T, h = 0, w = 0 — spatial RoPE is the identity for them.
         """
         T = self._T_seg
         H = self.grid_height
@@ -236,27 +212,23 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         pos_ids: torch.Tensor,
         seg_valid_mask: torch.Tensor | None = None,  # [B, n_segs] bool; None = all valid
     ) -> torch.Tensor:
-        """Run one ACBlock with segment-block-causal SDPA (FlashAttention v2).
+        """Run one block with segment-causal attention (FlashAttention v2).
 
-        Attention pattern: tokens in segment i attend to ALL tokens from
-        segments 0..i (past and present), but not from segments i+1..n_segs-1.
-        This is implemented by calling SDPA once per segment with an
-        incrementally growing key-value context — no N×N materialisation.
+        Segment i attends to all tokens in segments 0..i, never anything
+        later. We call SDPA once per segment with an incrementally growing
+        key/value range, so there's no N×N attention matrix.
 
-        SDPA dispatches to FlashAttention v2 when dtype=bf16/fp16, head_dim∈
-        {32,64,128,256}, and no additive mask is passed, giving O(N_q) memory.
-
-        When seg_valid_mask is provided (batch contains padded segments), an
-        additive key mask is built per SDPA call so padded key positions receive
-        -inf before softmax, zeroing their contribution.  SDPA then falls back
-        to the memory-efficient attention backend (still O(N_q), not O(N²)).
+        If seg_valid_mask is given (batch has padded segments), we add a
+        -inf mask over the padded key positions before softmax. That bumps
+        SDPA onto the memory-efficient backend instead of FlashAttention, but
+        it's still O(N_q), not O(N²).
         """
         B, n_segs, tps, D = x.shape
         N = n_segs * tps
         num_heads = blk.attn.num_heads
         head_dim  = D // num_heads
 
-        # ---- Norm + QKV (flat sequence for one GEMM) --------------------
+        # Norm + QKV, computed for the flat sequence in one GEMM
         y = blk.norm1(x.reshape(B, N, D))                        # [B, N, D]
         qkv = (
             blk.attn.qkv(y)
@@ -266,21 +238,19 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         q, k, v = qkv[0], qkv[1], qkv[2]                        # each [B, H, N, hd]
         q, k = self._apply_rope(q, k, pos_ids, blk.attn.grid_size)
 
-        #Segment causal SDPA: [B, H, n_segs, tps, hd]
+        # Split into segments: [B, H, n_segs, tps, hd]
         q_s = q.unflatten(2, (n_segs, tps))
         k_s = k.unflatten(2, (n_segs, tps))
         v_s = v.unflatten(2, (n_segs, tps))
 
-        # For segment i: Q_i attends to K_{0..i}, V_{0..i}.
-        # Each SDPA call uses the FlashAttention v2 backend (O(N_q) memory).
+        # Segment i's queries attend to keys/values from segments 0..i.
         seg_outs = []
         for i in range(n_segs):
             q_i  = q_s[:, :, i].contiguous()                # [B, H, tps, hd]
             k_kv = k_s[:, :, :i + 1].flatten(2, 3).contiguous()  # [B, H, (i+1)*tps, hd]
             v_kv = v_s[:, :, :i + 1].flatten(2, 3).contiguous()
             if seg_valid_mask is not None:
-                # Build additive key mask: 0 where valid, -inf where padded.
-                # [B, i+1] → expand to token level → [B, 1, 1, (i+1)*tps]
+                # Additive key mask: 0 where valid, -inf where padded.
                 seg_v = seg_valid_mask[:, :i + 1]            # [B, i+1]
                 kv_valid = (
                     seg_v.unsqueeze(-1)
@@ -292,7 +262,7 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
             else:
                 seg_outs.append(F.scaled_dot_product_attention(q_i, k_kv, v_kv))
 
-        # Reassemble: [B, H, n_segs, tps, hd] → [B, N, D]
+        # Reassemble segments back into the flat sequence: [B, N, D]
         attn_out = (
             torch.stack(seg_outs, dim=2)
             .flatten(2, 3)
@@ -304,14 +274,11 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
 
         x_flat = x.reshape(B, N, D) + blk.drop_path(attn_out)
 
-        # ---- MLP --------------------------------------------------------
         x_flat = x_flat + blk.drop_path(blk.mlp(blk.norm2(x_flat)))
 
         return x_flat.unflatten(1, (n_segs, tps))             # [B, n_segs, tps, D]
 
-    # ------------------------------------------------------------------
     # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -325,56 +292,54 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         B, S, P, _ = context_feats.shape
         D = self._predictor_embed_dim
         C = self.COND_TOKENS
-        tps    = C + P #tokens per segment
+        tps    = C + P  # tokens per segment
         n_segs = S + 1
 
-        # ---- Project context features to predictor dimension ------------
-        x_ctx = self.predictor_embed(context_feats)#[B, S, P, D]
+        # Project context features to the predictor's embedding dim
+        x_ctx = self.predictor_embed(context_feats)  # [B, S, P, D]
 
-        v_ctx = self.verb_embedding(context_verb_ids)#[B, S, D]
-        n_ctx = self.noun_embedding(context_noun_ids)#[B, S, D]
-        v_qry = self.verb_embedding(target_verb_id)#[B, D]
-        n_qry = self.noun_embedding(target_noun_id)#[B, D]
+        v_ctx = self.verb_embedding(context_verb_ids)  # [B, S, D]
+        n_ctx = self.noun_embedding(context_noun_ids)  # [B, S, D]
+        v_qry = self.verb_embedding(target_verb_id)  # [B, D]
+        n_qry = self.noun_embedding(target_noun_id)  # [B, D]
 
-        #[B, n_segs, tps, D]
-        cond_ctx = torch.stack([v_ctx, n_ctx], dim=2)#[B, S, 2, D]
-        ctx_segs = torch.cat([cond_ctx, x_ctx], dim=2)#[B, S, tps, D]
+        cond_ctx = torch.stack([v_ctx, n_ctx], dim=2)  # [B, S, 2, D]
+        ctx_segs = torch.cat([cond_ctx, x_ctx], dim=2)  # [B, S, tps, D]
 
-        cond_qry = torch.stack([v_qry, n_qry], dim=1)#[B, 2, D]
-        mask_toks = self.mask_token.expand(B, P, D)#[B, P, D]
-        qry_seg  = torch.cat([cond_qry, mask_toks], dim=1)#[B, tps, D]
+        cond_qry = torch.stack([v_qry, n_qry], dim=1)  # [B, 2, D]
+        mask_toks = self.mask_token.expand(B, P, D)  # [B, P, D]
+        qry_seg  = torch.cat([cond_qry, mask_toks], dim=1)  # [B, tps, D]
 
-        x = torch.cat([ctx_segs, qry_seg.unsqueeze(1)], dim=1)#[B, n_segs, tps, D]
+        x = torch.cat([ctx_segs, qry_seg.unsqueeze(1)], dim=1)  # [B, n_segs, tps, D]
 
-        # ---- Position IDs (computed once, shared across blocks) ---------
+        # Position IDs are the same for every block, so build them once
         pos_ids = self._build_pos_ids(n_segs, device=x.device)
 
-        # ---- Segment validity mask (only needed when batch has padding) --
-        # seg_valid_mask[b, j] = True if segment j is real for example b.
-        # Context segments at positions >= ctx_lengths[b] are padding.
+        # Only needed when the batch has padded context segments.
+        # seg_valid_mask[b, j] = True if segment j is real for example b;
+        # context segments at positions >= ctx_lengths[b] are padding.
         seg_valid_mask = None
         if ctx_lengths is not None and int(ctx_lengths.min()) < S:
             seg_valid_mask = torch.zeros(B, n_segs, dtype=torch.bool, device=x.device)
             for b in range(B):
                 seg_valid_mask[b, :ctx_lengths[b]] = True
-            seg_valid_mask[:, -1] = True   #query segment always valid
+            seg_valid_mask[:, -1] = True  # query segment is always valid
 
-        # ---- Predictor blocks -------------------------------------------
         do_checkpoint = self.use_activation_checkpointing and (
             self.checkpoint_min_segs is None or n_segs >= self.checkpoint_min_segs
         )
         for blk in self.predictor_blocks:
             if do_checkpoint:
-                #checkpoint only needs to track the gradient-carrying tensor x!
+                # Only x carries gradients, so that's all checkpoint needs to track
                 x = torch.utils.checkpoint.checkpoint(
                     lambda _x, _b=blk, _m=seg_valid_mask: self._run_block(_b, _x, pos_ids, _m), x, use_reentrant=False)
             else:
                 x = self._run_block(blk, x, pos_ids, seg_valid_mask)
 
-        # ---- Read out query patch tokens --------------------------------
-        x_query = x[:, -1, C:, :]#[B, P, D]
+        # Read out the query segment's patch tokens
+        x_query = x[:, -1, C:, :]  # [B, P, D]
         x_query = self.predictor_norm(x_query)
-        x_query = self.predictor_proj(x_query)#[B, P, E]
+        x_query = self.predictor_proj(x_query)  # [B, P, E]
 
         return x_query.view(B, self._T_seg, self.grid_height * self.grid_width, -1)
 

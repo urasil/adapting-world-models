@@ -33,7 +33,7 @@ echo "=== Job started at $(date) ==="
 echo "Prior mode:  $PRIOR_MODE"
 echo "Output file: $OUT_FILE"
 
-python3 -u "$WORK/qwen_val.py" \
+python3 -u "$WORK/qwen/qwen_val.py" \
     --annotations "$HOLOASSIST/data-annotation-trainval-v1_1.json" \
     --video-dir   "$HOLOASSIST/videos" \
     --val-list    "$VAL_LIST" \

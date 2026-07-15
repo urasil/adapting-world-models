@@ -86,7 +86,7 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 # ---- Full training run ---------------------------------------------------
 echo ""
 echo "--- Starting training ---"
-python3 -u "$WORK/train_mistake_detection.py" \
+python3 -u "$WORK/training/train_mistake_detection.py" \
     --index_path         "$INDEX_PATH" \
     --train_split_file   "$TRAIN_SPLIT_PATH" \
     --val_split_file     "$VAL_SPLIT_PATH" \

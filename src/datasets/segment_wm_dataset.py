@@ -1,4 +1,4 @@
-"""Dataset and collate utilities for next-segment world-model pre-training."""
+# dataset and collate utilities for next-segment world-model pre-training
 
 from collections import Counter
 from pathlib import Path
@@ -8,13 +8,8 @@ from torch.utils.data import Dataset, Sampler
 
 from mistake_detection_dataset import HoloMistakeDataset
 
-
 class _ExamplesProxy:
-    """Lightweight read-only view mapping SegmentWMDataset positions to base examples.
-
-    Allows VideoGroupedSampler and other train_mistake_detection utilities to
-    call dataset.examples[i] without copying the full examples list.
-    """
+    # read-only view mapping our positions to base examples, so callers can index without copying the list
     __slots__ = ("_base", "_idx")
 
     def __init__(self, base_examples: list, indices: list[int]):
@@ -27,70 +22,15 @@ class _ExamplesProxy:
     def __len__(self) -> int:
         return len(self._idx)
 
-
 class SegmentWMDataset(Dataset):
-    """Wraps HoloMistakeDataset for world-model pre-training.
+    # wraps HoloMistakeDataset for next-segment prediction: context = S prior segments, target = the last one
+    # keeps examples with prefix_len >= 2, drops ones with a big context-to-target gap or an odd-length target
+    # (only the target's duration is checked, since bounding every context segment discards way more examples)
 
-    Each item corresponds to one decision point: a variable-length context of
-    S = (prefix_len - 1) segments and one target segment.
-
-    Returns
-    -------
-    context_feats   : [max_context_segs, P, E]  float16  padded with zeros
-    context_verb_ids: [max_context_segs]         long     padded with 0
-    context_noun_ids: [max_context_segs]         long     padded with 0
-    target_feats    : [P, E]     float16
-    target_verb_id  : scalar     long
-    target_noun_id  : scalar     long
-    label           : scalar     float32  (0 = correct, 1 = mistake)
-    ctx_len         : scalar     int      actual number of context segments
-
-    Filtering
-    ---------
-    train_mode=True  : examples with prefix_len >= 2. (Class-balance subsampling
-                        of label == 0 vs label == 1, if desired, is done by the
-                        caller post-split via subsample_negatives from
-                        train_mistake_detection.py — see train_segment_wm.py.)
-    train_mode=False : examples with prefix_len >= 2.
-
-    max_gap_to_target_secs (default 2.0):
-        Drop examples where the last context segment ends more than this many
-        seconds before the target segment starts.  Uses prefix_start_secs /
-        prefix_end_secs written by enrich_index_with_actions.py.
-        Set to None or inf to disable.
-
-    target_duration_range_secs (default (0.5, 4.0)):
-        Drop examples whose target segment duration falls outside this range.
-        V-JEPA 2.1 feature extraction samples a fixed number of frames per
-        segment regardless of duration, so segment duration controls the
-        effective sampled frame rate; bounding it keeps that rate comparable
-        across examples. Only the target segment is checked, not context:
-        applying the same bound to every context segment compounds across
-        up to max_context_segs segments and was measured to discard the
-        majority of examples (>50%) for a confound that only affects ~18%
-        of individual segments, vs ~20% discarded when checking the target
-        alone. Context-segment duration is left unconstrained.
-        Set to None to disable.
-
-    The HoloMistakeDataset truncates long prefixes to max_segments.  We pass
-    max_context_segs + 1 so that after dropping the target we have at most
-    max_context_segs context segments.
-    """
-
-    def __init__(
-        self,
-        index_path: str | Path,
-        features_dirs=None,
-        train_mode: bool = True,
-        max_context_segs: int = 8,
-        max_gap_to_target_secs: float | None = 2.0,
-        target_duration_range_secs: tuple[float, float] | None = (0.5, 4.0),
-    ):
-        self._base = HoloMistakeDataset(
-            index_path=index_path,
-            features_dir=features_dirs,
-            max_segments=max_context_segs + 1,
-        )
+    def __init__(self, index_path: str | Path, features_dirs=None, train_mode: bool = True,
+                 max_context_segs: int = 8, max_gap_to_target_secs: float | None = 2.0,
+                 target_duration_range_secs: tuple[float, float] | None = (0.5, 4.0)):
+        self._base = HoloMistakeDataset(index_path=index_path, features_dir=features_dirs, max_segments=max_context_segs + 1)
 
         _max_gap = float("inf") if max_gap_to_target_secs is None else max_gap_to_target_secs
 
@@ -101,9 +41,7 @@ class SegmentWMDataset(Dataset):
             if len(ex["prefix_npz_indices"]) < 2:
                 continue
 
-            # Temporal-continuity filter on the last context → target transition.
-            # prefix_start_secs / prefix_end_secs are populated by the enrichment
-            # script; skip the check if they're absent (e.g., legacy index files).
+            # skip the gap/duration check if prefix_start_secs / prefix_end_secs are missing (legacy index files)
             if "prefix_start_secs" in ex and "prefix_end_secs" in ex:
                 ends   = ex["prefix_end_secs"]
                 starts = ex["prefix_start_secs"]
@@ -137,28 +75,22 @@ class SegmentWMDataset(Dataset):
 
     @property
     def examples(self):
-        """Lazy indexed view of base examples in filtered order.
-
-        VideoGroupedSampler (and other utilities from train_mistake_detection)
-        access dataset.examples[i] expecting the example dict at dataset
-        position i.  This property maps those positions through self._indices
-        to the underlying HoloMistakeDataset.
-        """
+        # lazy view of base examples in our filtered order, for callers that expect dataset.examples[i]
         return _ExamplesProxy(self._base.examples, self._indices)
 
     def __getitem__(self, i: int):
         orig = self._indices[i]
         ex = self._base.examples[orig]
 
-        # Load features (possibly truncated to max_context_segs+1 by the base).
+        # base may have truncated the prefix to max_context_segs+1
         feats, label = self._base[orig]   # (k, P, E) float16
 
-        # Align action-ID lists with the same truncation the base applied.
+        # match the same truncation on the verb/noun id lists
         k = feats.shape[0]
         verb_ids = ex["prefix_verb_ids"][-k:]
         noun_ids = ex["prefix_noun_ids"][-k:]
 
-        # Split the last segment off as the prediction target.
+        # last segment is the prediction target, the rest is context
         context_feats = feats[:-1]                                  # [S, P, E]
         target_feats  = feats[-1]                                   # [P, E]
         ctx_verb = torch.tensor(verb_ids[:-1], dtype=torch.long)   # [S]
@@ -171,15 +103,8 @@ class SegmentWMDataset(Dataset):
         return (context_feats, ctx_verb, ctx_noun, target_feats, tgt_verb, tgt_noun,
                 label, ctx_len)
 
-
 def wm_collate_fn(batch):
-    """Collate variable-length context batches.
-
-    Padding is done to the batch-local maximum context length, not the global
-    max_context_segs.  At B=1 (batch_size=1) this is always a no-op: every
-    example's true ctx_len equals the batch max, so ctx_lengths.min() == S and
-    the model never builds a seg_valid_mask, ensuring FA2 fires unconditionally.
-    """
+    # pads context to the batch's max length, not the global max, so a uniform-length batch is always a no-op
     ctx_f, ctx_v, ctx_n, tgt_f, tgt_v, tgt_n, labels, ctx_lens = zip(*batch)
     max_len = max(t.shape[0] for t in ctx_f)
 
@@ -206,33 +131,15 @@ def wm_collate_fn(batch):
         torch.tensor(list(ctx_lens), dtype=torch.long),        # [B]
     )
 
-
 def compute_ctx_lens(subset, max_context_segs: int) -> list[int]:
-    """ctx_len (context length, excluding target) for each position in a Subset of SegmentWMDataset."""
+    # context length (excluding target) for each position in a Subset of SegmentWMDataset
     full = subset.dataset
-    return [
-        min(len(full.examples[idx]["prefix_npz_indices"]) - 1, max_context_segs)
-        for idx in subset.indices
-    ]
-
+    return [min(len(full.examples[idx]["prefix_npz_indices"]) - 1, max_context_segs) for idx in subset.indices]
 
 class LengthGroupedBatchSampler(Sampler):
-    """Batches examples of identical ctx_len together so wm_collate_fn never pads.
-
-    Wraps a base per-example sampler (e.g. VideoGroupedSampler), preserving its
-    iteration order as closely as possible: examples are held in small
-    per-length buffers and a batch is emitted as soon as `batch_size` examples
-    of the same length have accumulated. Every batch is therefore uniform-
-    length, so wm_collate_fn's padding is always a no-op and the model never
-    builds a seg_valid_mask — FlashAttention v2 keeps firing, same as at
-    batch_size=1 (see wm_collate_fn docstring).
-
-    With drop_last=True (default, matching the rest of this codebase), at
-    most (batch_size - 1) examples per distinct ctx_len value are left in an
-    incomplete buffer at epoch end and dropped — negligible relative to
-    dataset size, and which specific examples are dropped varies by epoch
-    since the underlying order is reshuffled by the base sampler.
-    """
+    # batches examples of the same ctx_len together so wm_collate_fn never has to pad
+    # wraps a base sampler, buffering examples per length until batch_size accumulates
+    # with drop_last, up to (batch_size - 1) examples per length are left over each epoch and dropped
 
     def __init__(self, base_sampler, ctx_lens: list[int], batch_size: int, drop_last: bool = True):
         self.base_sampler = base_sampler

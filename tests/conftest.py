@@ -1,4 +1,4 @@
-"""Add project root to sys.path so tests can import src.* and top-level modules."""
+# adds the project root to sys.path so tests can import src.* and the category packages (training, evaluation, ...)
 import sys
 from pathlib import Path
 

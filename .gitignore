@@ -1,12 +1,15 @@
 hf_cache
-__pycache__
+**/__pycache__/
 .claude
 logs
 runs
 .pytest_cache
+features
+datasets
+results
 holoassist
 scripts
 venv_ampere
-requirements_ampere.lock
 requirements.txt
+CLAUDE.md
 vjepa2_1_vitl_dist_vitG_384.pt

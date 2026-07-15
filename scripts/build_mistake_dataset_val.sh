@@ -24,10 +24,10 @@ mkdir -p "$OUT_DIR"
 echo "=== Job started at $(date) ==="
 echo "Features dir: $FEATURES"
 
-n_npz=$(find "$FEATURES" -name "*.npz" 2>/dev/null | wc -l)
-echo "NPZ files in features dir: $n_npz"
+n_meta=$(find "$FEATURES" -name "*_meta.npz" 2>/dev/null | wc -l)
+echo "Metadata files in features dir: $n_meta"
 
-python3 -u "$WORK/build_mistake_detection_dataset.py" \
+python3 -u "$WORK/data_prep/build_mistake_detection_dataset.py" \
     --annotation_path "$HOLOASSIST/data-annotation-trainval-v1_1.json" \
     --features_dir    "$FEATURES" \
     --output_path     "$OUT_DIR/mistake_detection_index_val.json"

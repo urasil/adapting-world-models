@@ -30,7 +30,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo "=== Job started at $(date) ==="
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 
-python3 -u smoke_test_wm.py \
+python3 -u dev/smoke_test_wm.py \
     --train_index  datasets/wm_train_index.json \
     --train_split  holoassist/splits/train-v1_2.txt \
     --val_split    holoassist/splits/val-v1_2.txt \

@@ -32,7 +32,7 @@ set -euo pipefail
 # runs/wm_v1/best_val_l1_ep*.pt = best validation checkpoint seen so far
 #
 # Config (S=2, depth=6, D=1024, batch_size=4, act_ckpt off, exclude_tasks
-# marius/knarrevik/rashult) is the one validated safe by smoke_test_wm.py:
+# marius/knarrevik/rashult) is the one validated safe by dev/smoke_test_wm.py:
 # ~40 GB peak (vs 80 GB card) and ~1.54s/example.
 #
 # CAVEAT: if this job dies uncleanly (hard crash, not a normal exit), the
@@ -53,7 +53,7 @@ EPOCHS_PER_JOB=2   # ~2 x 15.3h = 30.6h train + ~1h val, inside the 35h cap.
 mkdir -p "$OUT_DIR" "$WORK/logs"
 
 module purge
-module load python/3.11.0-icl
+module load rhel8/slurm python/3.11.0-icl
 source "$WORK/venv_ampere/bin/activate"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -91,7 +91,7 @@ fi
 
 echo "done_epochs=$DONE_EPOCHS  target_epochs=$TARGET_EPOCHS/$TOTAL_EPOCHS  resume=${RESUME_FLAG:-no}"
 
-python3 -u train_segment_wm.py \
+python3 -u training/train_segment_wm.py \
     --train_index   datasets/wm_train_index.json \
     --val_index     datasets/wm_val_index.json \
     --train_split   holoassist/splits/train-v1_2.txt \

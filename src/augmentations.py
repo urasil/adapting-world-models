@@ -1,23 +1,11 @@
-"""
-Frame-level augmentations for V-JEPA augmentation sensitivity testing and
-augmented-data feature extraction.
-
-All functions operate on uint8 (T, C, H, W) tensors (PyTorch) and return
-the same dtype/shape so they slot straight into the existing feature-
-extraction pipeline.
-
-Augmentations are intentionally mild — they mimic plausible real-world
-variation for data augmentation (slightly different framing, indoor warm/cold
-lighting shift) rather than aggressive photometric distortions.
-
-AUG_REGISTRY_SENSITIVITY  — original 3-entry registry used by the
-                             augmentation sensitivity test script.
-AUG_REGISTRY               — full registry including the 4 training-data
-                             augmentation variants:
-                               warm_tint  cold_tint  crop_90  warm_crop
-                             These produce ≈4× more mistake examples, taking
-                             total mistakes to ~1/4 of the correct class.
-"""
+# frame-level augmentations for V-JEPA augmentation sensitivity testing and augmented-data feature extraction.
+# all functions operate on uint8 (T, C, H, W) tensors and return the same dtype/shape, so they slot
+# straight into the existing feature-extraction pipeline.
+# augmentations are intentionally mild -- they mimic plausible real-world variation (slightly different
+# framing, indoor warm/cold lighting shift) rather than aggressive photometric distortions.
+# AUG_REGISTRY_SENSITIVITY: original 3-entry registry used by the augmentation sensitivity test script.
+# AUG_REGISTRY: full registry including the 4 training-data augmentation variants (warm_tint, cold_tint,
+# crop_90, warm_crop), which produce ~4x more mistake examples, taking total mistakes to ~1/4 of correct.
 
 from __future__ import annotations
 
@@ -38,33 +26,7 @@ def slight_crop(
     center_bias_sigma: float = 0.4,
     rng: Optional[random.Random] = None,
 ) -> torch.Tensor:
-    """
-    Randomly crop each frame to `crop_frac ± crop_frac_jitter` of the original
-    spatial size, then resize back to the original (H, W).  The crop is the same
-    for all frames in the clip (so motion structure is preserved).
-
-    The crop offset is drawn from a Gaussian centred on the frame centre
-    (sigma = center_bias_sigma × max_possible_offset), so the task area —
-    which lives near the centre in egocentric footage — stays visible.
-    With the default sigma=0.4 the crop centre deviates by at most ~1 sigma
-    (≈ ±2 % of frame height/width for crop_frac=0.90), keeping all content
-    well within frame.
-
-    Args:
-        frames:              (T, C, H, W) uint8 tensor.
-        crop_frac:           Base fraction of each spatial dimension to keep.
-                             0.90 → crop window ≈ 90 % of original size.
-        crop_frac_jitter:    ±random variation around crop_frac (uniform).
-        center_bias_sigma:   Gaussian sigma as a fraction of the maximum
-                             possible offset.  Lower = tighter to centre.
-                             0.0 = always centre-crop (no randomness).
-                             1.0 ≈ uniform random (old behaviour).
-        rng:                 Optional seeded random.Random instance for
-                             reproducibility.  None → global random.
-
-    Returns:
-        (T, C, H, W) uint8 tensor, same shape as input.
-    """
+    # randomly crops each frame to crop_frac +/- crop_frac_jitter of the original size (same window for every frame, then resized back to (H, W)); crop offset is Gaussian-centred (sigma=center_bias_sigma x max offset) so the task area near frame centre stays visible
     if rng is None:
         rng = random.Random()
 
@@ -117,22 +79,7 @@ def warm_tint(
     g_factor: float = 1.04,
     b_factor: float = 0.90,
 ) -> torch.Tensor:
-    """
-    Apply a warm-light colour shift by scaling RGB channels independently.
-    Values are clamped to [0, 255] after scaling.
-
-    Default factors mimic warm (~3200 K) tungsten/incandescent lighting:
-    boost red (+18 %), slight green lift (+4 %), reduce blue (-10 %).
-
-    Args:
-        frames:    (T, C, H, W) uint8 tensor, channels in RGB order.
-        r_factor:  Multiplicative scale for the red channel.
-        g_factor:  Multiplicative scale for the green channel.
-        b_factor:  Multiplicative scale for the blue channel.
-
-    Returns:
-        (T, C, H, W) uint8 tensor.
-    """
+    # warm-light colour shift: scales RGB channels independently and clamps to [0, 255]; defaults mimic warm (~3200K) tungsten lighting (R+18%, G+4%, B-10%)
     frames_f = frames.float()  # avoid uint8 overflow during scaling
     factors = torch.tensor([r_factor, g_factor, b_factor],
                            dtype=torch.float32)  # (3,)
@@ -153,23 +100,7 @@ def cold_tint(
     g_factor: float = 0.97,
     b_factor: float = 1.15,
 ) -> torch.Tensor:
-    """
-    Apply a cool-light colour shift — the complement of warm_tint.
-
-    Default factors mimic cool (~6500 K) daylight / overcast sky:
-    reduce red (-15 %), slight green dip (-3 %), boost blue (+15 %).
-    The shift magnitude matches warm_tint so the two augmentations are
-    symmetric and neither dominates in L2 feature distance.
-
-    Args:
-        frames:    (T, C, H, W) uint8 tensor, channels in RGB order.
-        r_factor:  Multiplicative scale for the red channel.
-        g_factor:  Multiplicative scale for the green channel.
-        b_factor:  Multiplicative scale for the blue channel.
-
-    Returns:
-        (T, C, H, W) uint8 tensor.
-    """
+    # cool-light colour shift, the complement of warm_tint; mimics cool (~6500K) daylight (R-15%, G-3%, B+15%), matched in magnitude so neither augmentation dominates in L2 feature distance
     frames_f = frames.float()
     factors = torch.tensor([r_factor, g_factor, b_factor],
                            dtype=torch.float32).view(1, 3, 1, 1)
@@ -191,7 +122,7 @@ def combined_aug(
     b_factor: float = 0.90,
     rng: Optional[random.Random] = None,
 ) -> torch.Tensor:
-    """Apply slight_crop followed by warm_tint in one call."""
+    # applies slight_crop followed by warm_tint in one call
     frames = slight_crop(frames, crop_frac=crop_frac,
                          crop_frac_jitter=crop_frac_jitter,
                          center_bias_sigma=center_bias_sigma, rng=rng)
@@ -210,15 +141,7 @@ def warm_crop(
     b_factor: float = 0.90,
     rng: Optional[random.Random] = None,
 ) -> torch.Tensor:
-    """
-    90 % centre-biased crop followed by warm tint.
-
-    The 90 % crop (vs 70 % in combined_aug / slight_crop defaults) is mild
-    enough that V-JEPA 2.1 features remain highly similar to originals
-    (verified by augmentation sensitivity analysis: pooled cosine sim ≈ 0.997).
-    This augmentation is one of the four training-data variants used to
-    upsample the minority mistake class to ~1/4 of the correct class.
-    """
+    # 90% centre-biased crop followed by warm tint; mild enough that V-JEPA 2.1 features stay highly similar to originals (pooled cosine sim ~0.997, per augmentation sensitivity analysis) -- one of the 4 training-data variants used to upsample the minority mistake class
     frames = slight_crop(frames, crop_frac=crop_frac,
                          crop_frac_jitter=crop_frac_jitter,
                          center_bias_sigma=center_bias_sigma, rng=rng)
@@ -237,7 +160,7 @@ def cold_crop(
     b_factor: float = 1.15,
     rng: Optional[random.Random] = None,
 ) -> torch.Tensor:
-    """90 % centre-biased crop followed by cold tint."""
+    # 90% centre-biased crop followed by cold tint
     frames = slight_crop(frames, crop_frac=crop_frac,
                          crop_frac_jitter=crop_frac_jitter,
                          center_bias_sigma=center_bias_sigma, rng=rng)

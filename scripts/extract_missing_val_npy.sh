@@ -58,7 +58,6 @@ python3 -u src/vjepa2_1_segment_feature_extraction.py \
     --annotation_path "$HOLOASSIST/data-annotation-trainval-v1_1.json" \
     --video_dir       "$HOLOASSIST/videos" \
     --output_dir      "$VAL_NPY" \
-    --output_format   npy \
     --split_file      "$MISSING_LIST"
 
 rm -f "$MISSING_LIST"

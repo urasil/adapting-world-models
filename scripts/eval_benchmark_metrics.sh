@@ -25,7 +25,7 @@ echo "=== Eval job started at $(date) ==="
 echo "Run dir: $RUN_DIR"
 python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
 
-python3 -u "$WORK/eval_benchmark_metrics.py" \
+python3 -u "$WORK/evaluation/eval_benchmark_metrics.py" \
     --run_dir "$RUN_DIR" \
     --num_workers 4 \
     --batch_size 256

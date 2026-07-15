@@ -1,6 +1,21 @@
 # V-JEPA 2.1 expects tensor TxCxHxW (num_frames, channels, height, width).
-# Extracts ONE feature per HoloAssist fine-grained action segment, then
-# spatially pools tokens: (18432, 1024) -> (32, 1024) per segment.
+# Extracts ONE feature per HoloAssist fine-grained action segment: 18432
+# tokens (32 temporal x 576 spatial), kept un-pooled. Pool them down to
+# (32, 1024) afterwards with data_prep/convert_features_spatialpool.py if
+# a run needs the smaller/faster representation.
+#
+# Writes two files per video into --output_dir:
+#   <video_name>.npy       - features only, (num_segments, 32, 576, 1024)
+#                             float16. Plain (uncompressed) .npy so training
+#                             can mmap straight into it instead of
+#                             decompressing a multi-GB archive per read.
+#   <video_name>_meta.npz  - small per-segment metadata (segment_ids, labels,
+#                             verb, noun, start_sec, end_sec), read by
+#                             data_prep/build_mistake_detection_dataset.py and
+#                             data_prep/enrich_index_with_actions.py. Kept
+#                             separate from the features so it stays tiny and
+#                             fast to load even though the features array is
+#                             huge.
 import argparse
 import json
 import os
@@ -67,11 +82,7 @@ def load_model(device: str):
 
 
 def spatial_pool(feats_18432x1024: np.ndarray) -> np.ndarray:
-    """
-    Collapse spatial tokens, keep temporal structure.
-    (T_tokens * S_tokens, hidden) -> (T_tokens, S_tokens, hidden) -> mean over S
-    -> (T_tokens, hidden) i.e. (32, 1024)
-    """
+    # collapses spatial tokens, keeps temporal structure: (T*S, hidden) -> (T, S, hidden) -> mean over S -> (T, hidden) i.e. (32, 1024)
     n, h = feats_18432x1024.shape
     assert n == EXPECTED_TOKENS, f"expected {EXPECTED_TOKENS} tokens, got {n}"
     assert h == EXPECTED_HIDDEN, f"expected hidden {EXPECTED_HIDDEN}, got {h}"
@@ -80,10 +91,7 @@ def spatial_pool(feats_18432x1024: np.ndarray) -> np.ndarray:
 
 
 def extract_one_clip(processor, model, dtype, frames_tchw: torch.Tensor) -> np.ndarray:
-    """
-    Run one (NUM_FRAMES, 3, H, W) uint8 clip through the V-JEPA 2.1 encoder.
-    Returns spatially-pooled features as a (32, 1024) float16 numpy array.
-    """
+    # runs one (NUM_FRAMES, 3, H, W) uint8 clip through the V-JEPA 2.1 encoder, returns spatially-pooled (32, 1024) float16
     # Preprocessor expects (T, C, H, W) uint8; returns a tuple/list whose [0]
     # is the resized/normalised tensor.
     out = processor(frames_tchw)[0]
@@ -155,8 +163,7 @@ def _decode_frames(video_path: str, indices: List[int]) -> np.ndarray:
     return np.stack(result)
 
 
-def extract_segments_for_video(video_path: str, annotation_entry: dict,
-                               processor, model, dtype, test: bool = False) -> Dict[int, dict]:
+def extract_segments_for_video(video_path: str, annotation_entry: dict, processor, model, dtype, test: bool = False) -> Dict[int, dict]:
     # Extract one V-JEPA 2.1 feature per fine-grained action segment in this video
     with av.open(str(video_path)) as _c:
         _s = _c.streams.video[0]
@@ -164,9 +171,7 @@ def extract_segments_for_video(video_path: str, annotation_entry: dict,
         total_frames = _s.frames or int(_s.duration * float(_s.time_base) * fps)
 
     results = {}
-    segments = [
-        ev for ev in annotation_entry["events"] if ev["label"] == "Fine grained action"
-    ]
+    segments = [ev for ev in annotation_entry["events"] if ev["label"] == "Fine grained action"]
 
     for i, ev in enumerate(segments):
         attrs = ev.get("attributes", {})
@@ -232,7 +237,8 @@ def main():
         "--output_dir",
         type=str,
         required=True,
-        help="Where to save per-video feature files (one .npz per video).",
+        help="Where to save per-video feature files (one .npy + one "
+             "_meta.npz per video).",
     )
     parser.add_argument(
         "--test",
@@ -244,12 +250,6 @@ def main():
         type=str,
         default=None,
         help="Optional path to a split file. If not present, all videos in the annotation file are processed."
-    )
-    parser.add_argument(
-        "--output_format",
-        choices=["npz", "npy"],
-        default="npz",
-        help="npz saves all metadata (default, backwards-compatible); npy saves features only.",
     )
 
     args = parser.parse_args()
@@ -272,9 +272,9 @@ def main():
 
     for vi, entry in enumerate(annotations):
         video_name = entry["video_name"]
-        ext = ".npy" if args.output_format == "npy" else ".npz"
-        out_path = Path(args.output_dir) / f"{video_name}{ext}"
-        if out_path.exists():
+        out_path = Path(args.output_dir) / f"{video_name}.npy"
+        meta_path = Path(args.output_dir) / f"{video_name}_meta.npz"
+        if out_path.exists() and meta_path.exists():
             print(f"[{vi+1}/{len(annotations)}] {video_name}: already done, skipping")
             continue
         video_path = Path(args.video_dir) / video_name / "Export_py" / "Video_compress.mp4"
@@ -296,40 +296,26 @@ def main():
             print(f"  no usable segments")
             continue
 
-        # Pack into arrays for compact storage. All segments share the same
+        # Pack into one array for compact storage. All segments share the same
         # (T_tokens, hidden_dim) = (32, 1024) shape, so we can stack.
         seg_ids = sorted(seg_results.keys())
         feats = np.stack([seg_results[s]["features"] for s in seg_ids], axis=0).astype(np.float16)
         labels = np.array([seg_results[s]["label"] for s in seg_ids], dtype=np.int8)
-        starts = np.array([seg_results[s]["start"] for s in seg_ids], dtype=np.float32)
-        ends = np.array([seg_results[s]["end"] for s in seg_ids], dtype=np.float32)
-        verbs = np.array([seg_results[s]["verb"] for s in seg_ids])
-        nouns = np.array([seg_results[s]["noun"] for s in seg_ids])
-        raw = np.array([seg_results[s]["correctness_raw"] for s in seg_ids])
-        frame_idxs = np.stack([seg_results[s]["sampled_frame_indices"] for s in seg_ids], axis=0)
-        # fps is constant per video; store as scalar
-        fps_val = np.float32(next(iter(seg_results.values()))["fps"])
+        starts = np.array([seg_results[s]["start"] for s in seg_ids], dtype=np.float64)
+        ends = np.array([seg_results[s]["end"] for s in seg_ids], dtype=np.float64)
+        verbs = np.array([seg_results[s]["verb"] for s in seg_ids], dtype=object)
+        nouns = np.array([seg_results[s]["noun"] for s in seg_ids], dtype=object)
 
-        if args.output_format == "npy":
-            np.save(out_path, feats)
-        else:
-            np.savez_compressed(
-                out_path,
-                segment_ids=np.array(seg_ids, dtype=np.int32),
-                features=feats,                       # (num_segments, 32, 1024) float16
-                labels=labels,
-                start_sec=starts,
-                end_sec=ends,
-                verb=verbs,
-                noun=nouns,
-                correctness_raw=raw,
-                sampled_frame_indices=frame_idxs,
-                fps=fps_val,
-                video_name=np.array(video_name),
-                model_id=np.array(HUB_NAME),
-                checkpoint=np.array(LOCAL_CKPT),
-                pooling=np.array("none"),
-            )
+        np.save(out_path, feats)
+        np.savez(
+            meta_path,
+            segment_ids=np.array(seg_ids, dtype=np.int64),
+            labels=labels,
+            start_sec=starts,
+            end_sec=ends,
+            verb=verbs,
+            noun=nouns,
+        )
         print(f"saved {len(seg_ids)} segments -> {out_path} "
               f"(features {feats.shape}, mistakes {labels.sum()})")
 

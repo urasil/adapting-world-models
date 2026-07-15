@@ -1,6 +1,4 @@
-"""Shared between qwen_baseline.py and qwen_clips.py: model loading, HoloAssist
-annotation grouping, and response parsing that don't differ between the two
-prompting strategies."""
+# shared between qwen_baseline.py and qwen_clips.py: model loading, annotation grouping, response parsing
 import json
 import re
 from pathlib import Path
@@ -13,30 +11,19 @@ from src.utils.holoassist_labels import LABEL_MAP
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
-
 def load_model(device: str):
     dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        MODEL_ID, dtype=dtype,
-        device_map="auto" if device.startswith("cuda") else None,
-        attn_implementation="sdpa",
+        MODEL_ID, dtype=dtype, device_map="auto" if device.startswith("cuda") else None, attn_implementation="sdpa",
     ).eval()
     if not device.startswith("cuda"):
         model = model.to(device)
     return processor, model
 
-
 def group_fine_by_coarse(annotation_entry: dict) -> List[Tuple[dict, List[dict]]]:
-    """Return [(coarse_event, [fine_events_in_time_order]), ...].
-
-    Fine-grained events without a valid Action Correctness label are dropped,
-    as are those whose midpoint falls outside every coarse action.
-    """
-    coarse = sorted(
-        [ev for ev in annotation_entry["events"] if ev["label"] == "Coarse grained action"],
-        key=lambda x: x["start"],
-    )
+    # groups fine actions under their coarse action, in time order, dropping unlabeled or unmatched ones
+    coarse = sorted([ev for ev in annotation_entry["events"] if ev["label"] == "Coarse grained action"], key=lambda x: x["start"])
     fine = [ev for ev in annotation_entry["events"] if ev["label"] == "Fine grained action"]
 
     groups: List[Tuple[dict, List[dict]]] = [(c, []) for c in coarse]
@@ -57,31 +44,23 @@ def group_fine_by_coarse(annotation_entry: dict) -> List[Tuple[dict, List[dict]]
             out.append((c, members))
     return out
 
-
 def describe_fine_action(ev: dict) -> str:
-    """Compact verb/adjective/noun description, falling back gracefully."""
+    # compact verb/adjective/noun description, with a fallback for missing attrs
     a = ev.get("attributes", {})
-    parts = [str(a.get("Verb", "")).strip(),
-             str(a.get("Adjective", "")).strip(),
-             str(a.get("Noun", "")).strip()]
+    parts = [str(a.get("Verb", "")).strip(), str(a.get("Adjective", "")).strip(), str(a.get("Noun", "")).strip()]
     desc = " ".join(p for p in parts if p and p.lower() != "none")
     return desc if desc else "(unspecified action)"
-
 
 def describe_coarse_action(coarse: dict) -> str:
     a = coarse.get("attributes", {})
     sent = str(a.get("Action sentence", "")).strip()
     if sent:
         return sent
-    parts = [str(a.get("Verb", "")).strip(),
-             str(a.get("Adjective", "")).strip(),
-             str(a.get("Noun", "")).strip()]
+    parts = [str(a.get("Verb", "")).strip(), str(a.get("Adjective", "")).strip(), str(a.get("Noun", "")).strip()]
     return " ".join(p for p in parts if p and p.lower() != "none") or "(unspecified coarse action)"
-
 
 def correctness_label_text(correctness: str) -> str:
     return "mistake" if LABEL_MAP[correctness] == 1 else "correct"
-
 
 def parse_mistake_response(response: str) -> dict:
     out = {"mistake": None, "explanation": None, "raw": response}
@@ -93,14 +72,11 @@ def parse_mistake_response(response: str) -> dict:
         out["explanation"] = e.group(1).strip()
     return out
 
-
-# Resume support for qwen_val.py / qwen_clips_val.py: both write one JSONL
-# line per example and need to resume a partially-completed run.
+# resume support for qwen_val.py / qwen_clips_val.py: both write one jsonl line per example
 
 def expected_example_count(entry: dict) -> int:
-    """How many examples process_video will emit for this annotation entry."""
+    # how many examples process_video will emit for this annotation entry
     return sum(len(members) for _, members in group_fine_by_coarse(entry))
-
 
 def load_completed_videos(out_path: Path) -> dict:
     counts: dict = {}
@@ -119,7 +95,6 @@ def load_completed_videos(out_path: Path) -> dict:
             if v:
                 counts[v] = counts.get(v, 0) + 1
     return counts
-
 
 def rewrite_without_video(out_path: Path, video_name: str) -> None:
     if not out_path.exists():

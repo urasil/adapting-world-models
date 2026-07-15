@@ -25,7 +25,7 @@ echo "=== dump_predictions started at $(date) ==="
 echo "Run dir: $RUN_DIR"
 python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
 
-python3 -u "$WORK/dump_val_predictions.py" \
+python3 -u "$WORK/evaluation/dump_val_predictions.py" \
     --run_dir "$RUN_DIR" \
     --num_workers 0 \
     --batch_size 256

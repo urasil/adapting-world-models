@@ -57,7 +57,7 @@ if [ -n "$MAX_PRIOR_CLIPS" ]; then
     MAX_CLIPS_ARG="--max-prior-clips $MAX_PRIOR_CLIPS"
 fi
 
-python3 -u "$WORK/qwen_clips_val.py" \
+python3 -u "$WORK/qwen/qwen_clips_val.py" \
     --annotations "$HOLOASSIST/data-annotation-trainval-v1_1.json" \
     --video-dir   "$HOLOASSIST/videos" \
     --val-list    "$VAL_LIST" \
