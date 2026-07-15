@@ -1,4 +1,8 @@
 # adds per-segment verb/noun ids + timestamps to the mistake-detection index files.
+# verb/noun ids come from each example's parent coarse-grained action (coarse_verb/coarse_noun,
+# stamped by build_mistake_detection_dataset.py), not the fine-grained segment's own label:
+# every segment in an example's prefix already shares one coarse action by construction, so the
+# same id is broadcast across the whole prefix instead of varying per fine-grained segment.
 # vocab is built from train data only, val-only verbs/nouns map to __unknown__ so eval stays unbiased.
 # also writes prefix start/end secs so segmentwmdataset can filter for temporal continuity
 # without re-reading feature files.
@@ -14,35 +18,26 @@ from pathlib import Path
 import numpy as np
 
 def _load_meta(video_name: str, features_dirs: list[str]):
-    # returns (verb, noun, start_sec, end_sec) arrays from the _meta.npz for a video
+    # returns (start_sec, end_sec) arrays from the _meta.npz for a video
     for d in features_dirs:
         path = os.path.join(d, f"{video_name}_meta.npz")
         if os.path.exists(path):
             data = np.load(path, allow_pickle=True)
-            verb      = data["verb"].astype(str)
-            noun      = data["noun"].astype(str)
             start_sec = data["start_sec"].tolist()
             end_sec   = data["end_sec"].tolist()
             data.close()
-            return verb, noun, start_sec, end_sec
-    return None, None, None, None
+            return start_sec, end_sec
+    return None, None
 
-def _build_vocabs(examples: list[dict], features_dirs: list[str]):
-    # builds verb/noun vocabs from the given examples (train only, for an unbiased eval)
+def _build_vocabs(examples: list[dict]):
+    # builds verb/noun vocabs from each example's coarse-grained action label (train only, for an
+    # unbiased eval). one (coarse_verb, coarse_noun) pair per example, not per fine-grained segment.
     verb_counts: Counter = Counter()
     noun_counts: Counter = Counter()
-    cache: dict = {}
 
     for ex in examples:
-        vname = ex["video_name"]
-        if vname not in cache:
-            cache[vname] = _load_meta(vname, features_dirs)
-        verbs, nouns, _, _ = cache[vname]
-        if verbs is None:
-            continue
-        for idx in ex["prefix_npz_indices"]:
-            verb_counts[str(verbs[idx])] += 1
-            noun_counts[str(nouns[idx])] += 1
+        verb_counts[ex["coarse_verb"]] += 1
+        noun_counts[ex["coarse_noun"]] += 1
 
     def _make_vocab(counts: Counter) -> dict[str, int]:
         # sort by frequency descending, 0 reserved for unknown
@@ -54,7 +49,8 @@ def _build_vocabs(examples: list[dict], features_dirs: list[str]):
     return _make_vocab(verb_counts), _make_vocab(noun_counts)
 
 def _enrich(examples: list[dict], features_dirs: list[str], verb_vocab: dict, noun_vocab: dict) -> tuple[list[dict], int]:
-    # adds prefix_verb_ids, prefix_noun_ids, prefix_start_secs, prefix_end_secs
+    # adds prefix_verb_ids, prefix_noun_ids, prefix_start_secs, prefix_end_secs.
+    # the verb/noun id is the example's shared coarse-action id, broadcast across the whole prefix.
     cache: dict = {}
     n_missing = 0
     out = []
@@ -63,29 +59,28 @@ def _enrich(examples: list[dict], features_dirs: list[str], verb_vocab: dict, no
         vname = ex["video_name"]
         if vname not in cache:
             cache[vname] = _load_meta(vname, features_dirs)
-        verbs, nouns, start_secs, end_secs = cache[vname]
+        start_secs, end_secs = cache[vname]
 
         n = len(ex["prefix_npz_indices"])
         ex2 = dict(ex)
 
-        if verbs is None:
+        verb_id = verb_vocab.get(ex["coarse_verb"], 0)
+        noun_id = noun_vocab.get(ex["coarse_noun"], 0)
+        ex2["prefix_verb_ids"] = [verb_id] * n
+        ex2["prefix_noun_ids"] = [noun_id] * n
+
+        if start_secs is None:
             n_missing += 1
-            ex2["prefix_verb_ids"]    = [0] * n
-            ex2["prefix_noun_ids"]    = [0] * n
             ex2["prefix_start_secs"]  = [0.0] * n
             ex2["prefix_end_secs"]    = [0.0] * n
             out.append(ex2)
             continue
 
-        vids, nids, tstarts, tends = [], [], [], []
+        tstarts, tends = [], []
         for idx in ex["prefix_npz_indices"]:
-            vids.append(verb_vocab.get(str(verbs[idx]), 0))
-            nids.append(noun_vocab.get(str(nouns[idx]), 0))
             tstarts.append(float(start_secs[idx]))
             tends.append(float(end_secs[idx]))
 
-        ex2["prefix_verb_ids"]   = vids
-        ex2["prefix_noun_ids"]   = nids
         ex2["prefix_start_secs"] = tstarts
         ex2["prefix_end_secs"]   = tends
         out.append(ex2)
@@ -113,7 +108,7 @@ def main():
 
     # build vocab from train examples only.
     print(f"Building vocabs from {len(train_idx['examples'])} train examples …")
-    verb_vocab, noun_vocab = _build_vocabs(train_idx["examples"], features_dirs)
+    verb_vocab, noun_vocab = _build_vocabs(train_idx["examples"])
     n_verbs = max(verb_vocab.values()) + 1
     n_nouns = max(noun_vocab.values()) + 1
     print(f"  verbs: {n_verbs - 1} types  →  n_verbs={n_verbs}")

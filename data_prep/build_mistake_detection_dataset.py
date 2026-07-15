@@ -28,6 +28,8 @@ def build_examples_for_video(entry: dict, meta_path: Path):
 
     for coarse in coarse_actions:
         c_start, c_end = float(coarse["start"]), float(coarse["end"])
+        c_attrs = coarse.get("attributes", {})
+        c_verb, c_noun = str(c_attrs.get("Verb", "")), str(c_attrs.get("Noun", ""))
 
         # collect fine-grained segments whose midpoint lies in this coarse action
         inside = []  # (start_sec, npz_idx, segment_id, label)
@@ -46,6 +48,8 @@ def build_examples_for_video(entry: dict, meta_path: Path):
             examples.append({
                 "video_name": video_name,
                 "coarse_id": int(coarse["id"]),
+                "coarse_verb": c_verb,
+                "coarse_noun": c_noun,
                 "prefix_npz_indices": ordered_npz_idx[: k + 1],
                 "prefix_segment_ids": ordered_seg_ids[: k + 1],
                 "target_segment_id": ordered_seg_ids[k],
