@@ -50,6 +50,9 @@ class Tee:
         self._stdout.flush()
         self._f.flush()
 
+    def isatty(self):
+        return self._stdout.isatty()
+
     def close(self):
         self._f.close()
 
@@ -160,8 +163,9 @@ def main():
     # dataset
     with open(args.train_index) as f:
         idx_meta = json.load(f)
-    n_verbs, n_nouns = idx_meta["n_verbs"], idx_meta["n_nouns"]
-    p(f"\nVocab: {n_verbs} verbs  {n_nouns} nouns")
+    verb_vocab = [w for w, _ in idx_meta["verb_vocab"]]
+    noun_vocab = [w for w, _ in idx_meta["noun_vocab"]]
+    p(f"\nVocab: {len(verb_vocab)} verbs  {len(noun_vocab)} nouns")
     p("Loading dataset …")
 
     ds = SegmentWMDataset(
@@ -229,7 +233,7 @@ def main():
         embed_dim=encoder_dim,
         predictor_embed_dim=predictor_dim,
         depth=args.depth, num_heads=args.num_heads,
-        n_verbs=n_verbs, n_nouns=n_nouns,
+        verb_vocab=verb_vocab, noun_vocab=noun_vocab,
         max_context_segs=args.max_context_segs,
         normalize_targets=True,
         use_activation_checkpointing=args.act_ckpt,

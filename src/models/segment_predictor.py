@@ -3,6 +3,8 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer
+
 from src.models.ac_predictor import VisionTransformerPredictorAC
 from src.utils.modules import rotate_queries_or_keys
 from src.utils.tensors import trunc_normal_
@@ -20,6 +22,21 @@ def _separate_positions(pos_ids: torch.Tensor, H: int, W: int):
     return frame_ids.float(), height_ids.float(), width_ids.float()
 
 
+def _text_vocab_embeddings(words: list[str], model_name: str) -> torch.Tensor:
+    """Encodes each vocab word/phrase with a frozen pretrained text encoder, taking the CLS token's final hidden state. Underscore-joined labels (e.g. "joy_con_controller")
+    are turned into spaces first since the encoder's tokenizer is trained on natural text, not identifiers. Returns [len(words), hidden_dim] on CPU, the caller registers
+    it as a buffer, so it moves with the model's .to(device)."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    encoder = AutoModel.from_pretrained(model_name).eval()
+
+    texts = [w.replace("_", " ") for w in words]
+    batch = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        hidden = encoder(**batch).last_hidden_state  # [n, L, H]
+
+    return hidden[:, 0, :]  # [n, H] CLS token
+
+
 # Main class
 
 class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
@@ -34,7 +51,7 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
     Attention is segment-causal: segment i attends to all tokens in segments
     0..i and nothing after. We run this as one SDPA call per segment per
     layer with a growing key/value window, so FlashAttention v2 handles it in
-    O(N_q) memory instead of materialising an N×N mask.
+    O(N_q) memory instead of materialising an NxN mask.
 
     Positional encoding is 3D RoPE (time, height, width) on a single global
     temporal axis: segment s, frame f -> temporal index s*T_seg + f.
@@ -43,8 +60,12 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
     ACRoPEAttention treats action tokens.
 
     Differences from VisionTransformerPredictorAC:
-    - action_encoder / state_encoder / extrinsics_encoder are gone;
-      verb_embedding + noun_embedding take their place.
+    - action_encoder / state_encoder / extrinsics_encoder are gone; verb/noun
+      conditioning takes their place, via a frozen pretrained text encoder
+      (CLS-token embedding per vocab word, cached as a buffer at
+      construction time) plus a small trainable verb_proj/noun_proj Linear
+      into predictor_embed_dim. Verb and noun stay as two separate
+      conditioning tokens, each independently encoded — no separator needed.
     - Adds a learnable mask_token for the query segment.
     - forward() is fully overridden and never calls the parent's forward().
 
@@ -81,8 +102,9 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         wide_silu=True,
         use_activation_checkpointing=False,
         use_rope=True,
-        n_verbs: int = 47,
-        n_nouns: int = 158,
+        verb_vocab: list[str] = None,
+        noun_vocab: list[str] = None,
+        text_encoder_name: str = "bert-base-uncased",
         max_context_segs: int = 8,
         normalize_targets: bool = True,
         checkpoint_min_segs: int | None = None,
@@ -120,10 +142,20 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         del self.state_encoder
         del self.extrinsics_encoder
 
-        self.verb_embedding = nn.Embedding(n_verbs, predictor_embed_dim)
-        self.noun_embedding = nn.Embedding(n_nouns, predictor_embed_dim)
-        trunc_normal_(self.verb_embedding.weight, std=init_std)
-        trunc_normal_(self.noun_embedding.weight, std=init_std)
+        if verb_vocab is None or noun_vocab is None:
+            raise ValueError("verb_vocab and noun_vocab are required (lists of vocab words, ordered by id)")
+
+        verb_text_embed = _text_vocab_embeddings(verb_vocab, text_encoder_name)
+        noun_text_embed = _text_vocab_embeddings(noun_vocab, text_encoder_name)
+        self.register_buffer("verb_text_embed", verb_text_embed)  # [n_verbs, H], frozen
+        self.register_buffer("noun_text_embed", noun_text_embed)  # [n_nouns, H], frozen
+
+        text_dim = verb_text_embed.shape[-1]
+        self.verb_proj = nn.Linear(text_dim, predictor_embed_dim)
+        self.noun_proj = nn.Linear(text_dim, predictor_embed_dim)
+        for proj in (self.verb_proj, self.noun_proj):
+            trunc_normal_(proj.weight, std=init_std)
+            nn.init.constant_(proj.bias, 0)
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
 
@@ -216,7 +248,7 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
 
         Segment i attends to all tokens in segments 0..i, never anything
         later. We call SDPA once per segment with an incrementally growing
-        key/value range, so there's no N×N attention matrix.
+        key/value range, so there's no NxN attention matrix.
 
         If seg_valid_mask is given (batch has padded segments), we add a
         -inf mask over the padded key positions before softmax. That bumps
@@ -298,10 +330,10 @@ class SegmentMaskPredictorAC(VisionTransformerPredictorAC):
         # Project context features to the predictor's embedding dim
         x_ctx = self.predictor_embed(context_feats)  # [B, S, P, D]
 
-        v_ctx = self.verb_embedding(context_verb_ids)  # [B, S, D]
-        n_ctx = self.noun_embedding(context_noun_ids)  # [B, S, D]
-        v_qry = self.verb_embedding(target_verb_id)  # [B, D]
-        n_qry = self.noun_embedding(target_noun_id)  # [B, D]
+        v_ctx = self.verb_proj(self.verb_text_embed[context_verb_ids])  # [B, S, D]
+        n_ctx = self.noun_proj(self.noun_text_embed[context_noun_ids])  # [B, S, D]
+        v_qry = self.verb_proj(self.verb_text_embed[target_verb_id])  # [B, D]
+        n_qry = self.noun_proj(self.noun_text_embed[target_noun_id])  # [B, D]
 
         cond_ctx = torch.stack([v_ctx, n_ctx], dim=2)  # [B, S, 2, D]
         ctx_segs = torch.cat([cond_ctx, x_ctx], dim=2)  # [B, S, tps, D]

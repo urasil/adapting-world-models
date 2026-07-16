@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from mistake_detection_dataset import HoloMistakeDataset
+from src.datasets.mistake_detection_dataset import HoloMistakeDataset
 
 class _ExamplesProxy:
     # read-only view mapping our positions to base examples, so callers can index without copying the list

@@ -27,8 +27,8 @@ CFG = dict(
     mlp_ratio=4,
     qkv_bias=True,
     norm_layer=partial(nn.LayerNorm, eps=1e-6),
-    n_verbs=47,
-    n_nouns=158,
+    verb_vocab=[f"verb{i}" for i in range(47)],
+    noun_vocab=[f"noun{i}" for i in range(158)],
     normalize_targets=True,
     use_activation_checkpointing=True,
 )

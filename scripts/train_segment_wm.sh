@@ -31,9 +31,10 @@ set -euo pipefail
 # runs/wm_v1/last.pt        = most recent checkpoint (mid-epoch or epoch-end)
 # runs/wm_v1/best_val_l1_ep*.pt = best validation checkpoint seen so far
 #
-# Config (S=2, depth=6, D=1024, batch_size=4, act_ckpt off, exclude_tasks
-# marius/knarrevik/rashult) is the one validated safe by dev/smoke_test_wm.py:
-# ~40 GB peak (vs 80 GB card) and ~1.54s/example.
+# Config (S=2, depth=6, D=1024, batch_size=2, grad_accum_steps=128 -> 256
+# effective batch, act_ckpt off, exclude_tasks marius/knarrevik/rashult) is
+# the one validated safe by dev/smoke_test_wm.py: ~40.7 GB peak (vs 80 GB
+# card) at batch_size=2.
 #
 # CAVEAT: if this job dies uncleanly (hard crash, not a normal exit), the
 # self-resubmission line at the bottom never runs and the chain stops. Check
@@ -99,7 +100,7 @@ python3 -u training/train_segment_wm.py \
     --output_dir    "$OUT_DIR" \
     --max_context_segs 2 \
     --embed_dim 1024 --predictor_embed_dim 1024 --depth 6 --num_heads 16 \
-    --batch_size 4 --grad_accum_steps 64 \
+    --batch_size 2 --grad_accum_steps 128 \
     --exclude_tasks marius,knarrevik,rashult \
     --epochs "$TARGET_EPOCHS" \
     --ckpt_every_steps 20 \

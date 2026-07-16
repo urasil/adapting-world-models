@@ -122,18 +122,18 @@ def main():
     use_bf16 = (args.precision == "bf16" and device.type == "cuda")
     print(f"Device: {device}  precision: {args.precision}", flush=True)
 
-    # ---- load checkpoint metadata to get vocab sizes ----------------------
+    # ---- load checkpoint metadata to get vocab -----------------------------
     raw = torch.load(args.ckpt, map_location="cpu")
     ckpt_args = raw.get("args", {})
-    n_verbs = ckpt_args.get("n_verbs", None)
-    n_nouns = ckpt_args.get("n_nouns", None)
+    verb_vocab = ckpt_args.get("verb_vocab", None)
+    noun_vocab = ckpt_args.get("noun_vocab", None)
 
     # fall back to index metadata if not in ckpt
-    if n_verbs is None or n_nouns is None:
+    if verb_vocab is None or noun_vocab is None:
         with open(args.val_index) as f:
             idx_meta = json.load(f)
-        n_verbs = idx_meta["n_verbs"]
-        n_nouns = idx_meta["n_nouns"]
+        verb_vocab = [w for w, _ in idx_meta["verb_vocab"]]
+        noun_vocab = [w for w, _ in idx_meta["noun_vocab"]]
 
     # ---- model -------------------------------------------------------------
     model = segment_mask_predictor_ac(
@@ -145,8 +145,8 @@ def main():
         predictor_embed_dim=ckpt_args.get("predictor_embed_dim", 1024),
         depth=ckpt_args.get("depth", 24),
         num_heads=ckpt_args.get("num_heads", 16),
-        n_verbs=n_verbs,
-        n_nouns=n_nouns,
+        verb_vocab=verb_vocab,
+        noun_vocab=noun_vocab,
         max_context_segs=args.max_context_segs,
         normalize_targets=ckpt_args.get("normalize_targets", True),
         use_activation_checkpointing=False,  # not needed at eval

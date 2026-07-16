@@ -23,8 +23,8 @@ _P           = _T_SEG * _H * _W                  # 18 432
 _EMBED_DIM   = 256
 _PRED_DIM    = 256
 _NUM_HEADS   = 4
-_N_VERBS     = 48
-_N_NOUNS     = 164
+_VERB_VOCAB  = [f"verb{i}" for i in range(48)]
+_NOUN_VOCAB  = [f"noun{i}" for i in range(164)]
 _MAX_CTX     = 4
 
 def _make_model(depth: int, use_ckpt: bool) -> "SegmentMaskPredictorAC":
@@ -44,8 +44,8 @@ def _make_model(depth: int, use_ckpt: bool) -> "SegmentMaskPredictorAC":
         mlp_ratio=4,
         qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        n_verbs=_N_VERBS,
-        n_nouns=_N_NOUNS,
+        verb_vocab=_VERB_VOCAB,
+        noun_vocab=_NOUN_VOCAB,
         max_context_segs=_MAX_CTX,
         normalize_targets=True,
         use_activation_checkpointing=use_ckpt,
@@ -165,8 +165,8 @@ def test_batch2_padding_mask():
         mlp_ratio=2,
         qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        n_verbs=_N_VERBS,
-        n_nouns=_N_NOUNS,
+        verb_vocab=_VERB_VOCAB,
+        noun_vocab=_NOUN_VOCAB,
         max_context_segs=_MAX_CTX,   # 4
         normalize_targets=True,
         use_activation_checkpointing=False,

@@ -292,8 +292,8 @@ def main():
     # ---- dataset -----------------------------------------------------------
     with open(args.train_index) as f:
         idx_meta = json.load(f)
-    n_verbs = idx_meta["n_verbs"]
-    n_nouns = idx_meta["n_nouns"]
+    verb_vocab = [w for w, _ in idx_meta["verb_vocab"]]  # ordered by id, index 0 = "__unknown__"
+    noun_vocab = [w for w, _ in idx_meta["noun_vocab"]]
 
     full_ds = SegmentWMDataset(args.train_index, train_mode=True,
         max_context_segs=args.max_context_segs, max_gap_to_target_secs=args.max_gap_to_target_secs)
@@ -350,8 +350,8 @@ def main():
         predictor_embed_dim=args.predictor_embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
-        n_verbs=n_verbs,
-        n_nouns=n_nouns,
+        verb_vocab=verb_vocab,
+        noun_vocab=noun_vocab,
         max_context_segs=args.max_context_segs,
         normalize_targets=args.normalize_targets,
         use_activation_checkpointing=args.act_ckpt,
