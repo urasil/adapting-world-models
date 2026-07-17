@@ -36,8 +36,8 @@ if [ -n "$MAX_PRIOR_CLIPS" ]; then
 else
     RUN_TAG="${PRIOR_MODE}_${REASONING_MODE}"
 fi
-OUT_DIR="$WORK/results/qwen_clips_val/${RUN_TAG}"
-OUT_FILE="$OUT_DIR/predictions.jsonl"
+OUT_DIR="$WORK/results/qwen_final_baselines"
+OUT_FILE="$OUT_DIR/${RUN_TAG}.jsonl"
 mkdir -p "$OUT_DIR"
 
 module purge

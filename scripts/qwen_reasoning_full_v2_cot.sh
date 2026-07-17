@@ -15,7 +15,7 @@ REPO_ROOT="/home/ua248/rds/hpc-work/adapting_world_models"
 ANN="${REPO_ROOT}/holoassist/data-annotation-trainval-v1_1.json"
 VIDEO_DIR="${REPO_ROOT}/holoassist/videos"
 VAL_LIST="${REPO_ROOT}/holoassist/splits/val-v1_2.txt"
-OUT_ROOT="${REPO_ROOT}/runs/qwen_reasoning_full_v2/qwen_val"
+OUT_DIR="${REPO_ROOT}/results/qwen_final_baselines"
 PRIOR_MODE="actions_with_labels"
 
 cd "$REPO_ROOT"
@@ -25,15 +25,15 @@ module load python/3.11.0-icl
 source "$REPO_ROOT/venv_ampere/bin/activate"
 export HF_HOME="$REPO_ROOT/hf_cache"
 
-mkdir -p "$OUT_ROOT/cot"
+mkdir -p "$OUT_DIR"
 
 echo "=== Job started at $(date) ==="
 
-python3 -u "$REPO_ROOT/qwen_val.py" \
+python3 -u "$REPO_ROOT/qwen/qwen_val.py" \
     --annotations "$ANN" \
     --video-dir "$VIDEO_DIR" \
     --val-list "$VAL_LIST" \
-    --out "$OUT_ROOT/cot/results.jsonl" \
+    --out "$OUT_DIR/text_cot.jsonl" \
     --prior-mode "$PRIOR_MODE" \
     --reasoning-mode cot
 

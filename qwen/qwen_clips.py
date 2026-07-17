@@ -16,40 +16,38 @@ from qwen_vl_utils import process_vision_info
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.utils.qwen_common import (
     MODEL_ID, LABEL_MAP, load_model, group_fine_by_coarse,
-    describe_fine_action, describe_coarse_action, correctness_label_text,
+    describe_coarse_action, correctness_label_text,
     parse_mistake_response,
 )
 
 PRIOR_MODES = ("none", "clips", "clips_labelled")
 REASONING_MODES = ("direct", "cot")
 
-NEUTRAL_DEFINITION = (
-    "A sub-action is correct if the person performs the intended action, "
-    "with the right object, in a reasonable order. A sub-action "
-    "contains a mistake if the person performs the wrong action, "
-    "skips a required part or does it in the wrong order. "
-)
-
 DIRECT_RESPONSE_BLOCK = (
-    "Decide whether this sub-action is performed correctly or contains a "
-    "mistake, based only on what you can see in the clip and on the prior "
-    "sub-action clips shown above.\n\n"
+    "Decide, based only on what you can see in the clip and on the prior "
+    "sub-action clips shown above, whether this sub-action is a correct "
+    "progression towards the overall task or a mistake, given what the "
+    "performer has already done.\n\n"
     "Respond in EXACTLY this format and nothing else:\n"
     "MISTAKE: <no|yes>\n"
     "EXPLANATION: <one or two sentences>"
 )
 
-COT_RESPONSE_BLOCK_TEMPLATE = (
-    "Reason step by step before deciding. Respond in EXACTLY this format "
-    "and nothing else:\n\n"
+COT_RESPONSE_BLOCK = (
+    "Reason step by step before deciding whether this sub-action is a "
+    "correct progression towards the overall task or a mistake, given what "
+    "the performer has already done. Respond in EXACTLY this format and "
+    "nothing else:\n\n"
     "OBSERVATION: <describe concretely what the person does in the clip: "
     "which object(s) they handle, what action they perform, and where they "
     "direct it>\n"
-    "EXPECTED:    <given the overall task and prior sub-action clips, what would "
-    "a correct execution of \"{target_desc}\" look like? Note that preparatory actions are necessary "
-    "even if they don't directly complete the task goal.>\n"
-    "COMPARISON:  <does what you observed broadly on the target clip match what was expected? If it matches, "
-    "there is no mistake. If not, there might be a mistake.>\n"
+    "EXPECTED:    <given the overall task and the sub-actions completed so "
+    "far, what would be the correct progression at this point in the task? "
+    "Note that preparatory actions are necessary even if they don't directly "
+    "complete the task goal.>\n"
+    "COMPARISON:  <does what you observed on the target clip broadly match "
+    "that expected progression? If it matches, there is no mistake. If not, "
+    "there might be a mistake.>\n"
     "MISTAKE:     <no|yes>\n"
     "EXPLANATION: <one sentence summary>"
 )
@@ -67,21 +65,30 @@ def build_content(video_path: str, coarse: dict, members: List[dict], k: int, pr
     K = len(members)
     coarse_desc = describe_coarse_action(coarse)
     target = members[k - 1]
-    target_desc = describe_fine_action(target)
 
     content: List[dict] = []
 
     # task header
     header = (
         "You are watching a first-person egocentric procedural task video.\n"
-        f"Overall task: {coarse_desc}\n"
-        f"This task consists of {K} consecutive sub-actions.\n"
-        "You will be shown video clips of the sub-actions, each preceded by a "
-        "text label identifying the sub-action.\n"
+        f"Overall task (the instructor's coarse-grained instruction): {coarse_desc}\n"
+        f"This task consists of {K} consecutive sub-actions performed by the person (the performer).\n"
+        "Your job is to judge, given what the performer has already done "
+        "towards the overall task, whether the CURRENT sub-action shown "
+        "below is a correct progression or a mistake in that progression.\n"
+        "You will be shown video clips of the prior sub-actions, each "
+        "preceded by a text label, followed by the target clip to evaluate.\n"
     )
 
     # prior clips
-    if prior_mode == "none" or k == 1:
+    if k == 1:
+        header += "This is the first sub-action of the task. The performer has not done anything yet.\n"
+        content.append({"type": "text", "text": header})
+    elif prior_mode == "none":
+        header += (
+            f"The performer has already completed {k - 1} prior sub-action(s) "
+            "in this task, but their details are not shown to you here.\n"
+        )
         content.append({"type": "text", "text": header})
     else:
         prior_indices = list(range(k - 1))  # 0-indexed positions of prior sub-actions
@@ -98,15 +105,13 @@ def build_content(video_path: str, coarse: dict, members: List[dict], k: int, pr
 
         for i in prior_indices:
             m = members[i]
-            fine_desc = describe_fine_action(m)
 
             if prior_mode == "clips_labelled":
                 lbl = correctness_label_text(m["attributes"]["Action Correctness"])
-                label_suffix = f" - this sub-action was {lbl}"
+                clip_label = f"\nSub-action {i + 1} of {K}, this sub-action was {lbl}\n"
             else:
-                label_suffix = ""
+                clip_label = f"\nSub-action {i + 1} of {K}\n"
 
-            clip_label = f"\nSub-action {i + 1} of {K}: {fine_desc}{label_suffix}\n"
             content.append({"type": "text", "text": clip_label})
             content.append({
                 "type": "video",
@@ -122,7 +127,7 @@ def build_content(video_path: str, coarse: dict, members: List[dict], k: int, pr
     separator = "=" * 60
     target_intro = (
         f"\n{separator}\n"
-        f"TARGET CLIP - Sub-action {k} of {K}: {target_desc}\n"
+        f"TARGET CLIP - Sub-action {k} of {K} (the current sub-action to judge)\n"
         f"This is the clip you need to evaluate as correct or containing a mistake.\n"
         f"{separator}\n"
     )
@@ -137,19 +142,14 @@ def build_content(video_path: str, coarse: dict, members: List[dict], k: int, pr
         "max_frames": max_frames_target,
     })
 
-    # definitions + response format
-    if reasoning_mode == "direct":
-        response_block = DIRECT_RESPONSE_BLOCK
-    else:
-        response_block = COT_RESPONSE_BLOCK_TEMPLATE.format(target_desc=target_desc)
-
-    definition_and_response = f"\n{NEUTRAL_DEFINITION}\n\n{response_block}"
-    content.append({"type": "text", "text": definition_and_response})
+    # response format
+    response_block = DIRECT_RESPONSE_BLOCK if reasoning_mode == "direct" else COT_RESPONSE_BLOCK
+    content.append({"type": "text", "text": "\n" + response_block})
 
     # human-readable reconstruction for logging
     prompt_text = "\n".join(
         item["text"] if item["type"] == "text"
-        else f"[VIDEO {item.get('video_start', '?'):.1f}s – {item.get('video_end', '?'):.1f}s]"
+        else f"[VIDEO {item.get('video_start', '?'):.1f}s to {item.get('video_end', '?'):.1f}s]"
         for item in content
     )
 

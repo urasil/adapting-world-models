@@ -25,33 +25,31 @@ PRIOR_MODES = ("none", "actions", "actions_with_labels")
 #   cot    : chain-of-thought with observations, expectations, comparisons
 REASONING_MODES = ("direct", "cot")
 
-NEUTRAL_DEFINITION = (
-    "A sub-action is correct if the person performs the intended action, "
-    "with the right object, in a reasonable order. A sub-action "
-    "contains a mistake if the person performs the wrong action, "
-    "skips a required part or does it in the wrong order. "
-    )
-
 DIRECT_RESPONSE_BLOCK = (
-    "Decide whether this sub-action is performed correctly or contains a "
-    "mistake, based only on what you can see in the clip and on the prior "
-    "sub-actions listed above.\n\n"
+    "Decide, based only on what you can see in the clip and on the prior "
+    "sub-actions listed above, whether this sub-action is a correct "
+    "progression towards the overall task or a mistake, given what the "
+    "performer has already done.\n\n"
     "Respond in EXACTLY this format and nothing else:\n"
     "MISTAKE: <no|yes>\n"
     "EXPLANATION: <one or two sentences>"
 )
 
-COT_RESPONSE_BLOCK_TEMPLATE = (
-    "Reason step by step before deciding. Respond in EXACTLY this format "
-    "and nothing else:\n\n"
+COT_RESPONSE_BLOCK = (
+    "Reason step by step before deciding whether this sub-action is a "
+    "correct progression towards the overall task or a mistake, given what "
+    "the performer has already done. Respond in EXACTLY this format and "
+    "nothing else:\n\n"
     "OBSERVATION: <describe concretely what the person does in the clip: "
     "which object(s) they handle, what action they perform, and where they "
     "direct it>\n"
-    "EXPECTED:    <given the overall task and prior sub-actions, what would "
-    "a correct execution of \"{target_desc}\" look like? Note that preparatory actions are necessary "
-    "even if they don't directly complete the task goal.>\n"
-    "COMPARISON:  <does what you observed broadly match what was expected? If it matches, "
-    "there is no mistake. If not, there might be a mistake.>\n"
+    "EXPECTED:    <given the overall task and the sub-actions completed so "
+    "far, what would be the correct progression at this point in the task? "
+    "Note that preparatory actions are necessary even if they don't directly "
+    "complete the task goal.>\n"
+    "COMPARISON:  <does what you observed broadly match that expected "
+    "progression? If it matches, there is no mistake. If not, there might be "
+    "a mistake.>\n"
     "MISTAKE:     <no|yes>\n"
     "EXPLANATION: <one sentence summary>"
 )
@@ -63,41 +61,50 @@ def build_prompt(coarse: dict, members: List[dict], k: int,
 
     K = len(members)
     coarse_desc = describe_coarse_action(coarse)
-    target_desc = describe_fine_action(members[k - 1])
 
     header = (
         "You are watching a first-person egocentric procedural task video.\n"
-        f"Overall task: {coarse_desc}\n"
-        f"This task consists of {K} consecutive sub-actions.\n"
+        f"Overall task (the instructor's coarse-grained instruction): {coarse_desc}\n"
+        f"This task consists of {K} consecutive sub-actions performed by the person (the performer).\n"
+        "Your job is to judge, given what the performer has already done "
+        "towards the overall task, whether the CURRENT sub-action shown "
+        "below is a correct progression or a mistake in that progression.\n"
     )
 
     # build prior block (coherent wording regardless of context presence)
-    if prior_mode == "none" or k == 1:
-        prior_block = "This is the first sub-action of the task, there are no prior sub-actions.\n"
+    if k == 1:
+        prior_block = "This is the first sub-action of the task. The performer has not done anything yet.\n"
+    elif prior_mode == "none":
+        prior_block = (
+            f"The performer has already completed {k - 1} prior sub-action(s) "
+            "in this task, but their details are not shown to you here.\n"
+        )
     elif prior_mode == "actions":
         lines = [f"  {i+1}. {describe_fine_action(members[i])}" for i in range(k - 1)]
-        prior_block = "Previous sub-actions in this task, in order:\n" + "\n".join(lines) + "\n"
+        prior_block = (
+            "Below are the sub-actions the performer has completed so far "
+            "towards the overall task, in order:\n" + "\n".join(lines) + "\n"
+        )
     elif prior_mode == "actions_with_labels":
         lines = []
         for i in range(k - 1):
             lbl = correctness_label_text(members[i]["attributes"]["Action Correctness"])
             lines.append(f"  {i+1}. {describe_fine_action(members[i])} [{lbl}]")
         prior_block = (
-            "Previous sub-actions in this task, in order "
-            "(each annotated correct or mistake):\n" + "\n".join(lines) + "\n"
+            "Below are the sub-actions the performer has completed so far "
+            "towards the overall task, in order. Each is labelled correct or "
+            "mistake, based on whether it was the right progression to make "
+            "at that point:\n" + "\n".join(lines) + "\n"
         )
     else:
         raise ValueError(f"unknown prior_mode: {prior_mode}")
 
-    target_intro = (
-        f"\n{NEUTRAL_DEFINITION}\n\n"
-        f"The video clip below shows sub-action {k} of {K}: {target_desc}.\n"
-    )
+    target_intro = f"\nThe video clip below shows sub-action {k} of {K}, the current sub-action to judge.\n"
 
     if reasoning_mode == "direct":
         response_block = DIRECT_RESPONSE_BLOCK
     else:  # cot
-        response_block = COT_RESPONSE_BLOCK_TEMPLATE.format(target_desc=target_desc)
+        response_block = COT_RESPONSE_BLOCK
 
     return header + prior_block + target_intro + response_block
 
@@ -128,13 +135,27 @@ def run_inference(
     ]
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # return_video_metadata=true is required for qwen3vl: without it, process_vision_info
+    # uses the qwen2.5vl legacy path and puts fps as a list in video_kwargs, which the
+    # qwen3vl processor rejects (it validates fps as int|float|none, not list).
+    # with it, video_inputs contains (tensor, metadata_dict) tuples. we must unpack those
+    # and pass the metadata separately via video_metadata= so that the basevideoprocessor
+    # can construct videometadata objects with the native fps and frame indices needed for
+    # correct temporal position encoding.
     image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages, image_patch_size=processor.image_processor.patch_size, return_video_kwargs=True
+        messages,
+        image_patch_size=processor.image_processor.patch_size,
+        return_video_kwargs=True,
+        return_video_metadata=True,
     )
-    if isinstance(video_kwargs.get("fps"), list):
-        video_kwargs["fps"] = video_kwargs["fps"][0] if video_kwargs["fps"] else None
+    if video_inputs:
+        video_tensors = [v for v, _ in video_inputs]
+        video_metadatas = [m for _, m in video_inputs]
+    else:
+        video_tensors = video_metadatas = None
     inputs = processor(
-        text=[text], images=image_inputs, videos=video_inputs,
+        text=[text], images=image_inputs, videos=video_tensors,
+        video_metadata=video_metadatas,
         padding=True, return_tensors="pt", **video_kwargs,
     ).to(next(model.parameters()).device)
 
