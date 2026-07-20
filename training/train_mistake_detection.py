@@ -143,6 +143,20 @@ def subsample_negatives(dataset: HoloMistakeDataset, indices: List[int], neg_to_
     )
     return result
 
+def limit_examples(dataset: HoloMistakeDataset, indices: List[int], max_examples: int, seed: int = 0) -> List[int]:
+    # smoke-test helper: caps a split, keeping a mix of both classes
+    rng = random.Random(seed)
+    pos = [i for i in indices if dataset.examples[i]["label"] == 1]
+    neg = [i for i in indices if dataset.examples[i]["label"] == 0]
+    rng.shuffle(pos)
+    rng.shuffle(neg)
+    n_pos = min(len(pos), max(1, max_examples // 2))
+    n_neg = min(len(neg), max_examples - n_pos)
+    kept = sorted(pos[:n_pos] + neg[:n_neg])
+    print(f"Debug limit: capped at {max_examples} examples, kept {n_pos} positive + "
+          f"{n_neg} negative = {len(kept)} total (from {len(indices)})", flush=True)
+    return kept
+
 def task_of_video(video_name: str) -> str:
     # maps video_name -> task keyword (substring after the last '-'), strips IKEA '_assemble'/'_disassemble' suffixes so both count as the same task
     last = video_name.lower().split("-")[-1]
@@ -242,8 +256,9 @@ def cosine_lr(step: int, total_steps: int, base_lr: float,
     return final_lr + 0.5 * (base_lr - final_lr) * (1 + math.cos(math.pi * progress))
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, use_bf16: bool) -> dict:
-    # val loss + threshold-free ranking metrics (ap, auroc) + per-class p/r/f1 at the threshold that maximises positive-class (mistake) f1, see field comments below for each metric
+def evaluate(model, loader, criterion, device, use_bf16: bool, fixed_threshold: float = 0.5) -> dict:
+    # reports metrics at fixed_threshold (report this) and, suffixed "_swept",
+    # at a threshold swept on this val set (diagnostic only, not for reporting).
     model.eval()
     losses, logits_all, labels_all = [], [], []
 
@@ -263,15 +278,34 @@ def evaluate(model, loader, criterion, device, use_bf16: bool) -> dict:
     logits_all = np.concatenate(logits_all)
     labels_all = np.concatenate(labels_all)
     probs = 1.0 / (1.0 + np.exp(-logits_all))
+    n_total = len(labels_all)
 
-    # threshold sweep: maximise positive-class (mistake) f1.
+    preds_fixed = (probs >= fixed_threshold).astype(int)
+    fixed_metrics = _metrics_at_preds(labels_all, preds_fixed)
+
+    # sweep maximises mistake-class f1; diagnostic only, see note above.
     thresholds = np.linspace(0.01, 0.99, 99)
     f1s_pos = [f1_score(labels_all, probs >= t, zero_division=0) for t in thresholds]
     best_idx  = int(np.argmax(f1s_pos))
     best_thr  = float(thresholds[best_idx])
-    preds     = (probs >= best_thr).astype(int)
+    preds_swept = (probs >= best_thr).astype(int)
+    swept_metrics = _metrics_at_preds(labels_all, preds_swept)
 
-    # per-class p / r / f1 at the chosen threshold.
+    out = {
+        "loss":  float(np.sum(losses) / n_total),
+        "ap":    float(average_precision_score(labels_all, probs)),
+        "auroc": float(roc_auc_score(labels_all, probs)),
+        "fixed_threshold": fixed_threshold,
+        "best_thr": best_thr,  # the swept threshold
+        "n":            n_total,
+        "n_pos":        int((labels_all == 1).sum()),
+        "pos_rate":     float(labels_all.mean()),
+    }
+    out.update(fixed_metrics)
+    out.update({f"{k}_swept": v for k, v in swept_metrics.items()})
+    return out
+
+def _metrics_at_preds(labels_all, preds) -> dict:
     # labels=[0,1] forces both rows even if all predictions fall in one class.
     prec_arr, rec_arr, f1_arr, sup_arr = precision_recall_fscore_support(labels_all, preds, labels=[0, 1], zero_division=0)
 
@@ -288,10 +322,6 @@ def evaluate(model, loader, criterion, device, use_bf16: bool) -> dict:
     f1_inv_freq = float((f1_arr[0] * w_neg + f1_arr[1] * w_pos) / w_sum)
 
     return {
-        "loss":         float(np.sum(losses) / n_total),
-        "ap":           float(average_precision_score(labels_all, probs)),
-        "auroc":        float(roc_auc_score(labels_all, probs)),
-        "best_thr":     best_thr,
         # class 0 – no mistake
         "prec_neg":     float(prec_arr[0]),
         "rec_neg":      float(rec_arr[0]),
@@ -301,13 +331,9 @@ def evaluate(model, loader, criterion, device, use_bf16: bool) -> dict:
         "rec_pos":      float(rec_arr[1]),
         "f1_pos":       float(f1_arr[1]),
         # aggregates
-        "f1_macro":     float(f1_score(labels_all, preds, average="macro",    zero_division=0)),
+        "f1_macro":     float(f1_score(labels_all, preds, average="macro", zero_division=0)),
         "f1_inv_freq":  f1_inv_freq,
         "balanced_acc": float(balanced_accuracy_score(labels_all, preds)),
-        # dataset info
-        "n":            n_total,
-        "n_pos":        n_pos,
-        "pos_rate":     float(labels_all.mean()),
     }
 
 def train_one_epoch(model, loader, optimizer, criterion, device, *, base_lr: float, total_steps: int, start_step: int, grad_clip: float, use_bf16: bool, log_every: int, accum_steps: int = 1) -> dict:
@@ -435,10 +461,16 @@ def main():
     # (table 19): lr in {5e-3, 3e-3, 1e-3, 3e-4, 1e-4}, wd in {1e-4, 1e-3,
     # 1e-2, 1e-1}, batch_size 128, 20 epochs. sweep these externally.
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--total_epochs", type=int, default=None,
+                        help="True final epoch count for the LR schedule, when --epochs "
+                             "is an intermediate per-job target. Defaults to --epochs.")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--fixed_threshold", type=float, default=0.5,
+                        help="Decision threshold, fixed in advance rather than swept "
+                             "on validation. This is the number to report.")
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                         help="bf16 uses torch.autocast on cuda; fp32 disables it.")
     # runtime
@@ -479,6 +511,10 @@ def main():
     parser.add_argument("--val_features_dir", default=None, type=str,
                     help="Override features directory for validation split. "
                          "Useful when train and val features are in separate dirs.")
+    parser.add_argument("--limit_train_examples", type=int, default=None,
+                    help="Smoke-test only: cap the training set. Leave unset for a real run.")
+    parser.add_argument("--limit_val_examples", type=int, default=None,
+                    help="Smoke-test only: cap the validation set. Leave unset for a real run.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -515,6 +551,10 @@ def main():
         val_idx = filter_excluded_tasks(full, val_idx, exclude_tasks)
     if args.neg_subsample_ratio is not None:
         train_idx = subsample_negatives(full, train_idx, args.neg_subsample_ratio, seed=args.seed)
+    if args.limit_train_examples is not None:
+        train_idx = limit_examples(full, train_idx, args.limit_train_examples, seed=args.seed)
+    if args.limit_val_examples is not None:
+        val_idx = limit_examples(full, val_idx, args.limit_val_examples, seed=args.seed)
     longest = check_max_segments(full, train_idx + val_idx, args.max_segments)
     validate_feature_coverage(full, train_idx + val_idx)
     print(f"Split: {len(train_idx)} train / {len(val_idx)} val "
@@ -570,11 +610,13 @@ def main():
         print(f"Loss: BCEWithLogitsLoss(pos_weight={stats['pos_weight']:.2f})",
               flush=True)
 
-    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps) 
-    total_steps = steps_per_epoch * args.epochs
+    lr_total_epochs = args.total_epochs if args.total_epochs is not None else args.epochs
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+    total_steps = steps_per_epoch * lr_total_epochs
     effective_bs = args.batch_size * args.grad_accum_steps
     print(f"Total optimisation steps: {total_steps} "
-      f"({steps_per_epoch}/epoch x {args.epochs} epochs)", flush=True)
+      f"({steps_per_epoch}/epoch x {lr_total_epochs} lr-schedule epochs, "
+      f"this job runs up to epoch {args.epochs})", flush=True)
 
     # ---- resume -----------------------------------------------------------
     history = []
@@ -616,7 +658,7 @@ def main():
             log_every=args.log_every, accum_steps=args.grad_accum_steps,
         )
         step = train_stats["end_step"]
-        val = evaluate(model, val_loader, criterion, device, use_bf16)
+        val = evaluate(model, val_loader, criterion, device, use_bf16, fixed_threshold=args.fixed_threshold)
 
         elapsed = time.time() - t_epoch
         epoch_log = {
@@ -632,18 +674,24 @@ def main():
             f"[epoch {epoch:02d}/{args.epochs}]  "
             f"tr_loss={train_stats['loss']:.4f}  v_loss={val['loss']:.4f}  "
             f"AP={val['ap']:.4f}  AUROC={val['auroc']:.4f}  "
-            f"thr={val['best_thr']:.2f}  skipped={train_stats['n_skipped']}  "
+            f"skipped={train_stats['n_skipped']}  "
             f"({elapsed:.0f}s, ETA {eta_str})",
             flush=True,
         )
         print(
-            f"           "
+            f"           thr={val['fixed_threshold']:.2f} (fixed, reported)  "
             f"neg(no-mistake):  P={val['prec_neg']:.3f}  R={val['rec_neg']:.3f}  F1={val['f1_neg']:.3f}"
             f"  |  "
             f"pos(mistake):     P={val['prec_pos']:.3f}  R={val['rec_pos']:.3f}  F1={val['f1_pos']:.3f}"
             f"  |  "
             f"macro={val['f1_macro']:.3f}  inv-freq-wt={val['f1_inv_freq']:.3f}  bAcc={val['balanced_acc']:.3f}"
             f"  (n_pos={val['n_pos']})",
+            flush=True,
+        )
+        print(
+            f"           thr={val['best_thr']:.2f} (swept, diagnostic only)  "
+            f"pos(mistake): P={val['prec_pos_swept']:.3f}  R={val['rec_pos_swept']:.3f}  F1={val['f1_pos_swept']:.3f}"
+            f"  |  inv-freq-wt={val['f1_inv_freq_swept']:.3f}",
             flush=True,
         )
 
@@ -690,6 +738,11 @@ def main():
         f"  best_mistake_f1={best['mistake_f1']:.4f}(ep{best['epoch_mistake_f1']:02d})",
         flush=True,
     )
+
+    # marker file: presence means the run completed without raising
+    with open(output_dir / "SUCCESS.json", "w") as f:
+        json.dump({"epochs_completed": args.epochs, "best": best}, f, indent=2)
+    print(f"Wrote {output_dir / 'SUCCESS.json'}", flush=True)
 
 if __name__ == "__main__":
     main()
