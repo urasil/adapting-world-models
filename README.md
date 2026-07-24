@@ -1,11 +1,12 @@
 # Running the Pipeline
 
 1. Download the HoloAssist dataset.
-2. Extract V-JEPA 2.1 features from the videos.
-3. Build the dataset indices used for training.
-4. Train and evaluate the attentive probe.
-5. Train and evaluate the world model.
-6. Evaluate the VLM baseline (Qwen), no training needed.
+2. Download the V-JEPA 2.1 weights.
+3. Extract V-JEPA 2.1 features from the videos.
+4. Build the dataset indices used for training.
+5. Train and evaluate the attentive probe.
+6. Train and evaluate the world model.
+7. Evaluate the VLM baseline (Qwen), no training needed.
 
 Quick note on the commands, since this is run on the Cambridge cluster, most steps are launched with `sbatch some_script.sh`, which submits the job to that cluster's SLURM scheduler. Every `sbatch` command is wrapped by a simple `python3` command that actually does the work. 
 
@@ -18,9 +19,11 @@ pip install -r requirements.txt
 export HF_HOME="$WORK/hf_cache"
 ```
 
-The V-JEPA 2.1 encoder architecture is pulled from `facebookresearch/vjepa2` through `torch.hub`. The weights themselves are loaded separately from a local checkpoint file, `vjepa2_1_vitl_dist_vitG_384.pt`, which is in the GitHub repo. 
+The V-JEPA 2.1 encoder architecture is pulled from `facebookresearch/vjepa2` through `torch.hub`. The weights themselves are loaded separately from a local checkpoint file, `vjepa2_1_vitl_dist_vitG_384.pt` - see step 2 for how to get it.
 
 ## 1. Get the HoloAssist dataset
+
+*No GPU. The video archive is large (`holoassist/videos/` is 145 GB once extracted), so disk space and a few hours for the download.*
 
 ```bash
 cd holoassist
@@ -33,14 +36,24 @@ This downloads three things into `holoassist/`:
 - `data-annotation-trainval-v1_1.json`, the action and mistake annotations.
 - `data-splits-v1_2.zip`, the train, val, and test split lists. Unzip it into `holoassist/splits/{train,val,test}-v1_2.txt`.
 
-## 2. Extract V-JEPA 2.1 features
+## 2. Get the V-JEPA 2.1 weights
+
+*No GPU needed. The checkpoint is 4.8 GB.*
+
+The checkpoint is not committed to the GitHub repo. It has to be fetched separately and placed at the repo root as `vjepa2_1_vitl_dist_vitG_384.pt`.
+
+The checkpoint is the official V-JEPA 2.1 release from Meta, the distilled ViT-L/384 encoder (`vjepa2_1_vit_large_384` in `torch.hub`, distilled from a ViT-g teacher). Get it from the checkpoints table in the [`facebookresearch/vjepa2`](https://github.com/facebookresearch/vjepa2) repo.
+
+## 3. Extract V-JEPA 2.1 features
+
+*GPU required.  The train split (1,466 videos) takes around 50 hours of GPU time, where the val split (207 videos) takes 7 hours. 
 
 The script that does this is `src/vjepa2_1_segment_feature_extraction.py`. For every fine-grained action segment in HoloAssist, it samples 64 frames and runs them through the V-JEPA 2.1 encoder. What comes out for each segment is the full set of 18,432 tokens (32 temporal positions by 576 spatial positions), each 1024-dimensional.
 
-For every video, this writes two files into the output directory:
+For every video, this writes two files into the output directory, one `.npy` and one `.npz` per video. 
 
 - `<video_name>.npy`, the features themselves, shaped `(num_segments, 32, 576, 1024)`. This is a plain, uncompressed `.npy` file, as compression doesn't provide the storage benefit I previously thought it would.
-- `<video_name>_meta.npz`, a small file holding everything else about each segment: its label, verb, noun, start and end times, and segment ID. This stays tiny even though the features file next to it can be huge, and it's what the dataset-building scripts in step 3 read from.
+- `<video_name>_meta.npz`, a small file holding everything else about each segment: its label, verb, noun, start and end times, and segment ID. This stays tiny even though the features file next to it can be huge, and it's what the dataset-building scripts in step 4 read from.
 
 ```bash
 sbatch scripts/extraction.sh       #train split, writes to features/vjepa2_train/
@@ -69,8 +82,9 @@ python3 data_prep/convert_features_spatialpool.py --split both
 Note that this script currently has its input and output directories
 hardcoded at the top of the file rather than taken as arguments.
 
-## 3. Build the dataset indices
+## 4. Build the dataset indices
 
+*No GPU. Building both the train and val index took a couple minutes total. 
 Two indices are built here, the second layered on top of the first.
 
 The mistake-detection index is what the attentive probe trains on. For every coarse action, it creates one training example per prefix of
@@ -84,8 +98,7 @@ python3 data_prep/merge_mistake_datasets.py  #merges both into datasets/mistake_
 
 (The merged file is what training actually loads. It gets split back into train and val at training time using the video-name split lists from step 1.)
 
-The world-model index takes those same indices and adds the extra fields the world model needs but the probe doesn't -> per-segment verb and noun IDs,
-plus timestamps. This information comes from the `_meta.npz` files written in step 2.
+The world-model index takes those same indices and adds the extra fields the world model needs but the probe doesn't -> per-segment verb and noun IDs, plus timestamps. This information comes from the `_meta.npz` files written in step 3.
 
 ```bash
 python3 data_prep/enrich_index_with_actions.py \
@@ -98,7 +111,21 @@ python3 data_prep/enrich_index_with_actions.py \
 
 This writes `datasets/wm_train_index.json` and `datasets/wm_val_index.json`.
 
-## 4. Train and evaluate the attentive probe
+### What's actually in these JSON files
+A small header (`features_dir`, `feature_key`, `num_examples`, and for the `wm_*` files only: `n_verbs`/`n_nouns`/`verb_vocab`/`noun_vocab`) plus an `examples` list. These files hold the indices into the `.npy`/`_meta.npz` files from step 3. 
+
+Each entry in `examples` is one training example: one prefix of fine-grained sub-actions within a single coarse action:
+- `video_name`, `coarse_id` 
+- `coarse_verb`, `coarse_noun` 
+- `prefix_npz_indices` - indices into that video's `_meta.npz` arrays (and the matching rows of the `.npy` feature file) for every fine-grained segment in the prefix, oldest first.
+- `prefix_segment_ids` - the HoloAssist annotation IDs for those same segments, same order.
+- `target_segment_id` - the segment the label applies to and it is redundant.
+- `label`
+- `wm_*` files only: `prefix_verb_ids`, `prefix_noun_ids` (the coarse verb/noun, vocab-indexed and broadcast across the whole prefix), `prefix_start_secs`, `prefix_end_secs`.
+
+## 5. Train and evaluate the attentive probe
+
+*GPU required. `train_mistake_detection.sh` peak GPU memory is 34 GB. Per-epoch time averages 5.3 hours.  `eval_benchmark_metrics.sh` and `dump_predictions.sh` are both quick GPU jobs, maybe 10 to 20 minutes.*
 
 ```bash
 sbatch scripts/train_mistake_detection.sh 10 1e-3 1e-2 #arguments are EPOCHS LR WD, see the script header for the full list
@@ -128,7 +155,9 @@ python3 evaluation/dump_val_predictions.py \
     --checkpoint best_ap_ep08.pt
 ```
 
-## 5. Train and evaluate the world model
+## 6. Train and evaluate the world model
+
+*GPU required. Peak GPU memory is 40.7 GB at the configured `batch_size=2, grad_accum_steps=128`. It takes 15.7 hours per epoch.
 
 ```bash
 sbatch scripts/train_segment_wm.sh #writes runs/wm_v1/last.pt and runs/wm_v1/best_val_l1_ep*.pt
@@ -143,7 +172,9 @@ python3 evaluation/eval_segment_wm.py \
     --output    runs/wm_v1/eval.json
 ```
 
-## 6. Evaluate the VLM baseline (Qwen3-VL-8B-Instruct, zero-shot)
+## 7. Evaluate the VLM baseline (Qwen3-VL-8B-Instruct, zero-shot)
+
+*GPU required. `qwen_clips_val.sh` peak GPU memory observed was 17-21 GB. Wall-clock is mode-dependent: `direct` reasoning with few prior clips finished in under 5 hours. The `cot` approach with text history took less than 30 hours and `cot clips` approach took around 50 hours.
 
 There's no training in this stage, only zero-shot evaluation. Here, we write one JSON line per example, with the prediction and the ground-truth label, to whatever path you pass as `--out`.
 

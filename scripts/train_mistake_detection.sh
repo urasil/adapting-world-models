@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH --time=36:00:00
+#SBATCH --time=29:00:00
 #SBATCH --output=logs/probe_d1_%j.log
 set -euo pipefail
 # Attentive probe, depth=1, full token grid (18432 tokens/segment).
