@@ -10,6 +10,8 @@
 
 Quick note on the commands, since this is run on the Cambridge cluster, most steps are launched with `sbatch some_script.sh`, which submits the job to that cluster's SLURM scheduler. Every `sbatch` command is wrapped by a simple `python3` command that actually does the work. 
 
+None of the scripts keep a log of their own. All the readable output just goes to stdout, and under `sbatch` the `#SBATCH --output=` line at the top of the script catches it, nearly always into `logs/`. That line does nothing if you run a script directly, so add your logging lines yourself when you want to keep a copy. Result files are a separate thing and each step below says where they land.
+
 ## 0. Set up the environment
 
 ```bash
@@ -125,27 +127,15 @@ Each entry in `examples` is one training example: one prefix of fine-grained sub
 
 ## 5. Train and evaluate the attentive probe
 
-*GPU required. `train_mistake_detection.sh` peak GPU memory is 34 GB. Per-epoch time averages 5.3 hours.  `eval_benchmark_metrics.sh` and `dump_predictions.sh` are both quick GPU jobs, maybe 10 to 20 minutes.*
+*GPU required. `train_mistake_detection.sh` peak GPU memory is 34 GB. Per-epoch time averages 5.3 hours. `dump_predictions.sh` is a quick GPU job, maybe 10 to 20 minutes.*
 
 ```bash
 sbatch scripts/train_mistake_detection.sh 10 1e-3 1e-2 #arguments are EPOCHS LR WD, see the script header for the full list
 ```
 
-Once you have a trained run directory, something like `runs/full_bs128_lr1e-3_wd1e-2_29411291/`, containing files such as `best_ap_ep08.pt`, `best_macro_f1_ep08.pt`, and `last.pt`.
+Once you have a trained run directory, something like `runs/full_bs128_lr1e-3_wd1e-2_29411291/`, containing files such as `best_ap_ep08.pt`, `best_macro_f1_ep08.pt`, and `last.pt`. Training also writes `history.json` there, one entry per epoch with train/val loss, val AP and AUROC, so you can see how the run went without re-running anything.
 
-Computing eval metrics:
-
-```bash
-sbatch scripts/eval_benchmark_metrics.sh runs/full_bs128_lr1e-3_wd1e-2_29411291
-
-#the plain call, --checkpoint has to match a real file in run_dir
-python3 evaluation/eval_benchmark_metrics.py \
-    --run_dir   runs/full_bs128_lr1e-3_wd1e-2_29411291 \
-    --checkpoint best_ap_ep08.pt \
-    --batch_size 256
-```
-
-You can also dump per-example predictions on val, which is useful for comparing against the Qwen predictions by matching on `(video_name, coarse_id, target_segment_id)`.
+Per-example val predictions, saved to `<run_dir>/val_predictions.jsonl`. This is the file you join against the Qwen baseline on `(video_name, coarse_id, target_segment_id)`:
 
 ```bash
 sbatch scripts/dump_predictions.sh runs/full_bs128_lr1e-3_wd1e-2_29411291
